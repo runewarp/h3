@@ -63,6 +63,8 @@ where
 {
     stream: ConnectRecvStream<C, B>,
     capsules: CapsuleReader,
+    /// The client finished or reset its side of the CONNECT stream, or we stopped reading it
+    ended: bool,
 }
 
 /// WebTransport session driver.
@@ -232,6 +234,7 @@ where
             connect_recv: Mutex::new(ConnectRecv {
                 stream: recv,
                 capsules: CapsuleReader::default(),
+                ended: false,
             }),
             state: Arc::default(),
             draft,
@@ -371,6 +374,11 @@ where
     /// The session terminates when either endpoint closes it, or when the CONNECT stream ends:
     /// a clean end without a close counts as a close with code 0 and an empty message.
     ///
+    /// This returns once both sides of the CONNECT stream are closed. After [`Self::close`], that
+    /// means waiting for the client to close its side, which it does on receiving the close. Until
+    /// then, closing the QUIC connection could lose the close, so wait for this first. If the
+    /// client might not respond, wait with a timeout.
+    ///
     /// Closes from the client are only noticed while this or [`Self::draining`] is being polled.
     pub async fn closed(&self) -> Result<CloseInfo, SessionError> {
         poll_fn(|cx| self.poll_connect_stream(cx, SessionState::is_terminated)).await;
@@ -396,8 +404,30 @@ where
                 }
             }
         }
+        drop(send);
+
+        //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
+        //# To avoid this, the endpoint SHOULD wait until all CONNECT streams have
+        //# been closed by the peer before sending the CONNECTION_CLOSE
+        poll_fn(|cx| self.poll_connect_stream_end(cx)).await;
 
         outcome
+    }
+
+    /// Discards data on the CONNECT stream until the client finishes or resets it.
+    fn poll_connect_stream_end(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.state.register(cx.waker());
+        let waker = self.state.waker();
+        let mut stream_cx = Context::from_waker(&waker);
+
+        let mut recv = self.connect_recv.lock().unwrap();
+        while !recv.ended {
+            match ready!(recv.stream.poll_recv_data(&mut stream_cx)) {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => recv.ended = true,
+            }
+        }
+        Poll::Ready(())
     }
 
     /// Waits until the client asks to close the session gracefully, or the session terminates.
@@ -439,6 +469,7 @@ where
                     }
                 }
                 Ok(None) if recv.capsules.is_empty() => {
+                    recv.ended = true;
                     //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
                     //# Cleanly terminating a CONNECT stream without a WT_CLOSE_SESSION
                     //# capsule SHALL be semantically equivalent to terminating it with a
@@ -449,23 +480,31 @@ where
                         reason: String::new(),
                     })
                 }
-                Ok(None) => Err(SessionError::MalformedCapsule(
-                    "CONNECT stream ended within a capsule",
-                )),
-                Err(err) => Err(SessionError::Stream(Arc::new(err))),
+                Ok(None) => {
+                    recv.ended = true;
+                    Err(SessionError::MalformedCapsule(
+                        "CONNECT stream ended within a capsule",
+                    ))
+                }
+                Err(err) => {
+                    recv.ended = true;
+                    Err(SessionError::Stream(Arc::new(err)))
+                }
             };
 
             match &outcome {
-                Ok(_) => {
+                Ok(_) if !recv.ended => {
                     //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
                     //# After receiving the WT_CLOSE_SESSION capsule, the receiver MAY send a
                     //# STOP_SENDING with error code WT_SESSION_GONE.
                     recv.stream.stop_sending(Code::from(crate::WT_SESSION_GONE));
+                    recv.ended = true;
                 }
-                Err(SessionError::MalformedCapsule(_)) => {
+                Err(SessionError::MalformedCapsule(_)) if !recv.ended => {
                     recv.stream.stop_sending(Code::H3_MESSAGE_ERROR);
+                    recv.ended = true;
                 }
-                Err(_) => {}
+                _ => {}
             }
             self.state.terminate(outcome);
         }

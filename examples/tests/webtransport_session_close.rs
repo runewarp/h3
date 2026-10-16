@@ -82,6 +82,7 @@ async fn server_closes() {
             read_to_end(&mut setup.stream).await,
             close_capsule(7, b"done")
         );
+        setup.stream.finish().await.unwrap();
         let outcome = timeout(TIMEOUT, setup.session.closed()).await.unwrap();
         assert_eq!(outcome.unwrap(), info(7, "done"));
 
@@ -248,6 +249,31 @@ async fn streams_are_reset_when_the_session_is_dropped() {
             err.to_string().contains(&format!("{WT_SESSION_GONE:#x}")),
             "{err}"
         );
+    })
+    .await
+    .expect("WebTransport test timed out");
+}
+
+#[tokio::test]
+async fn closed_waits_for_the_client_to_close_the_connect_stream() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut setup = setup().await;
+        setup.session.close(7, "done").await.unwrap();
+        // The capsule is followed by a FIN right away.
+        assert_eq!(
+            read_to_end(&mut setup.stream).await,
+            close_capsule(7, b"done")
+        );
+
+        // Dropping the connection now could lose the close, so closed() waits for the client.
+        let session = setup.session.clone();
+        let closed = tokio::spawn(async move { session.closed().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!closed.is_finished());
+
+        setup.stream.finish().await.unwrap();
+        let outcome = timeout(TIMEOUT, closed).await.unwrap().unwrap();
+        assert_eq!(outcome.unwrap(), info(7, "done"));
     })
     .await
     .expect("WebTransport test timed out");
