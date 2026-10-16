@@ -5,9 +5,12 @@
 //! WebTransport over HTTP/3: <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/>
 #![deny(missing_docs)]
 
+mod capsule;
 /// Server side WebTransport session support
 pub mod server;
+mod state;
 /// Webtransport stream types
 pub mod stream;
 
 pub use h3::webtransport::SessionId;
+pub use state::WT_SESSION_GONE;
