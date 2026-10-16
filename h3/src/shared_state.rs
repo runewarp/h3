@@ -66,6 +66,11 @@ pub trait ConnectionState {
         err
     }
 
+    /// Get the settings sent by the peer, if they have been received yet
+    fn peer_settings(&self) -> Option<&Settings> {
+        self.shared_state().settings.get()
+    }
+
     /// Get the settings
     fn settings(&self) -> Cow<'_, Settings> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2

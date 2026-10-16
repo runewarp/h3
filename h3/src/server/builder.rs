@@ -31,6 +31,7 @@ use crate::{
     config::Config,
     connection::ConnectionInner,
     error::ConnectionError,
+    ext::WebTransportDraft,
     quic::{self},
     shared_state::SharedState,
 };
@@ -95,6 +96,18 @@ impl Builder {
     #[inline]
     pub fn enable_webtransport(&mut self, value: bool) -> &mut Self {
         self.config.settings.enable_webtransport = value;
+        self
+    }
+
+    /// Sets the WebTransport drafts to advertise when WebTransport is enabled.
+    ///
+    /// By default every draft in [`WebTransportDraft::ALL`] is advertised, and each connection
+    /// uses the latest draft that the client also supports.
+    pub fn webtransport_drafts(
+        &mut self,
+        drafts: impl IntoIterator<Item = WebTransportDraft>,
+    ) -> &mut Self {
+        self.config.settings.webtransport_drafts = drafts.into_iter().collect();
         self
     }
 

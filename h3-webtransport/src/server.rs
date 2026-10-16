@@ -13,7 +13,7 @@ use h3::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
         ConnectionError, StreamError,
     },
-    ext::Protocol,
+    ext::{Protocol, WebTransportDraft},
     frame::FrameStream,
     proto::frame::Frame,
     quic::{self, OpenStreams, WriteBuf},
@@ -52,6 +52,8 @@ where
     server_conn: Mutex<Connection<C, B>>,
     connect_stream: RequestStream<C::BidiStream, B>,
     opener: Mutex<C::OpenStreams>,
+    /// The negotiated wire format
+    draft: WebTransportDraft,
     /// Shared State
     ///
     /// Shared state is already in server_conn, but with this it is not necessary to lock the mutex
@@ -85,6 +87,14 @@ where
     ) -> Result<Self, StreamError> {
         let shared = conn.inner.shared.clone();
 
+        //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-7.1
+        //# For this reason, the server MUST NOT process
+        //# any incoming WebTransport requests until the client's SETTINGS have
+        //# been received.
+        poll_fn(|cx| conn.poll_peer_settings(cx))
+            .await
+            .map_err(StreamError::ConnectionError)?;
+
         let config = shared.settings();
 
         if !config.enable_webtransport() {
@@ -96,6 +106,26 @@ where
                     )),
             ));
         }
+
+        let Some(draft) = conn
+            .inner
+            .config
+            .settings
+            .negotiate_webtransport_draft(&config)
+        else {
+            return Err(StreamError::ConnectionError(
+                conn.inner
+                    .handle_connection_error(InternalConnectionError::new(
+                        Code::H3_SETTINGS_ERROR,
+                        format!(
+                            "no webtransport draft is supported by both client ({:?}) and server ({:?})",
+                            config.webtransport_drafts().collect::<Vec<_>>(),
+                            conn.inner.config.settings.webtransport_drafts().collect::<Vec<_>>(),
+                        ),
+                    )),
+            ));
+        };
+        tracing::debug!("Using WebTransport {draft:?}");
 
         if !config.enable_datagram() {
             return Err(StreamError::ConnectionError(
@@ -127,12 +157,15 @@ where
 
         //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.3
         let response = if validate_wt_connect(&request) {
-            Response::builder()
-                // This is the only header that chrome cares about.
-                .header("sec-webtransport-http3-draft", "draft02")
-                .status(StatusCode::OK)
-                .body(())
-                .unwrap()
+            let mut response = Response::builder();
+            if draft == WebTransportDraft::Draft02 {
+                //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-02#section-6
+                //# The server SHALL reply with a Sec-
+                //# Webtransport-Http3-Draft header indicating the selected version; its
+                //# value SHALL be draft02 for the version described in this draft.
+                response = response.header("sec-webtransport-http3-draft", "draft02");
+            }
+            response.status(StatusCode::OK).body(()).unwrap()
         } else {
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -151,6 +184,7 @@ where
             opener,
             server_conn: Mutex::new(conn),
             connect_stream: stream,
+            draft,
             shared,
         })
     }
@@ -222,6 +256,11 @@ where
     /// Returns the session id
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    /// Returns the WebTransport draft used by this session
+    pub fn draft(&self) -> WebTransportDraft {
+        self.draft
     }
 }
 
@@ -421,5 +460,5 @@ where
 
 fn validate_wt_connect(request: &Request<()>) -> bool {
     let protocol = request.extensions().get::<Protocol>();
-    matches!((request.method(), protocol), (&Method::CONNECT, Some(p)) if p == &Protocol::WEB_TRANSPORT)
+    matches!((request.method(), protocol), (&Method::CONNECT, Some(p)) if p.is_webtransport())
 }

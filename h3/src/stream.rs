@@ -46,7 +46,17 @@ where
     Ok(())
 }
 
-const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE + Frame::MAX_ENCODED_SIZE;
+// Large enough for the control stream header, which carries a whole SETTINGS frame.
+const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE
+    + max_usize(Frame::MAX_ENCODED_SIZE, Settings::MAX_FRAME_ENCODED_SIZE);
+
+const fn max_usize(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 
 /// Wrap frames to encode their header on the stack before sending them on the wire
 ///
@@ -743,6 +753,32 @@ mod tests {
 
         let id = w.get_var().unwrap();
         println!("Got id: {id}");
+    }
+
+    #[test]
+    fn write_control_header_with_largest_settings() {
+        use crate::{config::Config, ext::WebTransportDraft, server};
+
+        let mut builder = server::builder();
+        builder
+            .send_grease(true)
+            .max_field_section_size(VarInt::MAX.0)
+            .enable_extended_connect(true)
+            .enable_datagram(true)
+            .enable_webtransport(true)
+            .webtransport_drafts(WebTransportDraft::ALL)
+            .max_webtransport_sessions(VarInt::MAX.0);
+        let config: Config = builder.config;
+        let settings = Settings::try_from(config).unwrap();
+
+        let mut w = WriteBuf::<Bytes>::from(UniStreamHeader::Control(settings));
+        assert_eq!(w.get_var().unwrap(), StreamType::CONTROL.value());
+        let mut rest = w.copy_to_bytes(w.remaining());
+        assert_matches::assert_matches!(
+            Frame::<crate::proto::frame::PayloadLen>::decode(&mut rest),
+            Ok(Frame::Settings(_))
+        );
+        assert!(!rest.has_remaining());
     }
 
     #[test]

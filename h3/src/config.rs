@@ -1,6 +1,9 @@
 use std::convert::TryFrom;
 
-use crate::proto::{frame, varint::VarInt};
+use crate::{
+    ext::WebTransportDraft,
+    proto::{frame, varint::VarInt},
+};
 
 /// Configures the HTTP/3 connection
 #[derive(Debug, Clone, Copy)]
@@ -41,21 +44,91 @@ pub struct Settings {
     pub(crate) enable_datagram: bool,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
+    /// The WebTransport drafts advertised when `enable_webtransport` is set, or the drafts the peer
+    /// advertised.
+    pub(crate) webtransport_drafts: WebTransportDrafts,
+}
+
+/// A set of [`WebTransportDraft`]s
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WebTransportDrafts(u8);
+
+impl WebTransportDrafts {
+    pub(crate) const ALL: Self = Self(0b1111);
+
+    fn bit(draft: WebTransportDraft) -> u8 {
+        match draft {
+            WebTransportDraft::Draft02 => 1 << 0,
+            WebTransportDraft::Draft07 => 1 << 1,
+            WebTransportDraft::Draft13 => 1 << 2,
+            WebTransportDraft::Draft15 => 1 << 3,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, draft: WebTransportDraft) {
+        self.0 |= Self::bit(draft);
+    }
+
+    pub(crate) fn contains(&self, draft: WebTransportDraft) -> bool {
+        self.0 & Self::bit(draft) != 0
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = WebTransportDraft> {
+        WebTransportDraft::ALL
+            .into_iter()
+            .filter(move |draft| self.contains(*draft))
+    }
+}
+
+impl FromIterator<WebTransportDraft> for WebTransportDrafts {
+    fn from_iter<T: IntoIterator<Item = WebTransportDraft>>(iter: T) -> Self {
+        let mut drafts = Self::default();
+        for draft in iter {
+            drafts.insert(draft);
+        }
+        drafts
+    }
 }
 
 impl From<&frame::Settings> for Settings {
     fn from(settings: &frame::Settings) -> Self {
         let defaults: Self = Default::default();
+
+        let enabled = |id| settings.get(id).is_some_and(|value| value != 0);
+        let webtransport_drafts: WebTransportDrafts = [
+            (
+                frame::SettingId::ENABLE_WEBTRANSPORT,
+                WebTransportDraft::Draft02,
+            ),
+            (
+                frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07,
+                WebTransportDraft::Draft07,
+            ),
+            (
+                frame::SettingId::WT_MAX_SESSIONS,
+                WebTransportDraft::Draft13,
+            ),
+            (frame::SettingId::WT_ENABLED, WebTransportDraft::Draft15),
+        ]
+        .into_iter()
+        .filter(|(id, _)| enabled(*id))
+        .map(|(_, draft)| draft)
+        .collect();
+
         Self {
             max_field_section_size: settings
                 .get(frame::SettingId::MAX_HEADER_LIST_SIZE)
                 .unwrap_or(defaults.max_field_section_size),
-            enable_webtransport: settings
-                .get(frame::SettingId::ENABLE_WEBTRANSPORT)
-                .map(|value| value != 0)
-                .unwrap_or(defaults.enable_webtransport),
+            enable_webtransport: !webtransport_drafts.is_empty(),
+            webtransport_drafts,
             max_webtransport_sessions: settings
                 .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS)
+                .or_else(|| settings.get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07))
+                .or_else(|| settings.get(frame::SettingId::WT_MAX_SESSIONS))
                 .unwrap_or(defaults.max_webtransport_sessions),
             enable_datagram: settings
                 .get(frame::SettingId::H3_DATAGRAM)
@@ -85,6 +158,7 @@ impl TryFrom<Config> for frame::Settings {
                     enable_extended_connect,
                     enable_datagram,
                     max_webtransport_sessions,
+                    webtransport_drafts,
                 },
         } = value;
 
@@ -120,15 +194,37 @@ impl TryFrom<Config> for frame::Settings {
             frame::SettingId::ENABLE_CONNECT_PROTOCOL,
             enable_extended_connect as u64,
         )?;
-        settings.insert(
-            frame::SettingId::ENABLE_WEBTRANSPORT,
-            enable_webtransport as u64,
-        )?;
         settings.insert(frame::SettingId::H3_DATAGRAM, enable_datagram as u64)?;
-        settings.insert(
-            frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
-            max_webtransport_sessions,
-        )?;
+
+        if enable_webtransport {
+            for draft in webtransport_drafts.iter() {
+                match draft {
+                    WebTransportDraft::Draft02 => {
+                        settings.insert(frame::SettingId::ENABLE_WEBTRANSPORT, 1)?;
+                        settings.insert(
+                            frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
+                            max_webtransport_sessions,
+                        )?;
+                    }
+                    // A value of 0 would mean WebTransport is not supported.
+                    WebTransportDraft::Draft07 => settings.insert(
+                        frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07,
+                        max_webtransport_sessions.max(1),
+                    )?,
+                    // Draft 14 enables flow control when both endpoints send a value greater
+                    // than "1" here (or a nonzero SETTINGS_WT_INITIAL_MAX_* setting). WebTransport
+                    // flow control is not implemented, so this is always 1.
+                    WebTransportDraft::Draft13 => {
+                        settings.insert(frame::SettingId::WT_MAX_SESSIONS, 1)?
+                    }
+                    // Draft 16: "servers supporting WebTransport over HTTP/3 send: A
+                    // SETTINGS_WT_ENABLED setting with a value of "1""
+                    WebTransportDraft::Draft15 => {
+                        settings.insert(frame::SettingId::WT_ENABLED, 1)?
+                    }
+                }
+            }
+        }
 
         Ok(settings)
     }
@@ -142,6 +238,7 @@ impl Default for Settings {
             enable_extended_connect: false,
             enable_datagram: false,
             max_webtransport_sessions: 0,
+            webtransport_drafts: WebTransportDrafts::ALL,
         }
     }
 }
@@ -151,6 +248,20 @@ impl Settings {
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub fn enable_webtransport(&self) -> bool {
         self.enable_webtransport
+    }
+
+    /// The WebTransport drafts that are supported, oldest first
+    pub fn webtransport_drafts(&self) -> impl Iterator<Item = WebTransportDraft> {
+        self.webtransport_drafts.iter()
+    }
+
+    /// Picks the WebTransport draft to use with a peer: the latest one supported by both.
+    ///
+    /// `self` are the local settings, `peer` the settings received from the peer.
+    pub fn negotiate_webtransport_draft(&self, peer: &Settings) -> Option<WebTransportDraft> {
+        self.webtransport_drafts()
+            .filter(|draft| peer.webtransport_drafts.contains(*draft))
+            .last()
     }
 
     /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
@@ -175,5 +286,101 @@ impl Default for Config {
             send_settings: true,
             settings: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(settings: &[(frame::SettingId, u64)]) -> Settings {
+        let mut frame = frame::Settings::default();
+        for (id, value) in settings {
+            frame.insert(*id, *value).unwrap();
+        }
+        (&frame).into()
+    }
+
+    fn local(drafts: &[WebTransportDraft]) -> Settings {
+        Settings {
+            enable_webtransport: true,
+            webtransport_drafts: drafts.iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn advertised_drafts_round_trip() {
+        let config = Config {
+            settings: local(&WebTransportDraft::ALL),
+            ..Default::default()
+        };
+        let frame = frame::Settings::try_from(config).unwrap();
+        let settings = Settings::from(&frame);
+
+        assert!(settings.enable_webtransport());
+        assert_eq!(
+            settings.webtransport_drafts().collect::<Vec<_>>(),
+            WebTransportDraft::ALL
+        );
+        assert_eq!(frame.get(frame::SettingId::ENABLE_WEBTRANSPORT), Some(1));
+        assert_eq!(
+            frame.get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07),
+            Some(1)
+        );
+        assert_eq!(frame.get(frame::SettingId::WT_MAX_SESSIONS), Some(1));
+        assert_eq!(frame.get(frame::SettingId::WT_ENABLED), Some(1));
+    }
+
+    #[test]
+    fn only_selected_drafts_are_advertised() {
+        let config = Config {
+            settings: local(&[WebTransportDraft::Draft07]),
+            ..Default::default()
+        };
+        let frame = frame::Settings::try_from(config).unwrap();
+
+        assert_eq!(frame.get(frame::SettingId::ENABLE_WEBTRANSPORT), None);
+        assert_eq!(
+            frame.get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07),
+            Some(1)
+        );
+        assert_eq!(frame.get(frame::SettingId::WT_MAX_SESSIONS), None);
+        assert_eq!(frame.get(frame::SettingId::WT_ENABLED), None);
+    }
+
+    #[test]
+    fn webtransport_disabled_advertises_nothing() {
+        let frame = frame::Settings::try_from(Config::default()).unwrap();
+        let settings = Settings::from(&frame);
+
+        assert!(!settings.enable_webtransport());
+        assert_eq!(settings.webtransport_drafts().count(), 0);
+    }
+
+    #[test]
+    fn negotiates_latest_common_draft() {
+        use WebTransportDraft::*;
+
+        // Chrome and Firefox
+        let legacy = peer(&[(frame::SettingId::ENABLE_WEBTRANSPORT, 1)]);
+        // Safari 26
+        let hybrid = peer(&[
+            (frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+            (frame::SettingId::WT_MAX_SESSIONS, 1),
+        ]);
+        let latest = peer(&[(frame::SettingId::WT_ENABLED, 1)]);
+        let none = peer(&[(frame::SettingId::ENABLE_WEBTRANSPORT, 0)]);
+
+        let all = local(&WebTransportDraft::ALL);
+        assert_eq!(all.negotiate_webtransport_draft(&legacy), Some(Draft02));
+        assert_eq!(all.negotiate_webtransport_draft(&hybrid), Some(Draft13));
+        assert_eq!(all.negotiate_webtransport_draft(&latest), Some(Draft15));
+        assert_eq!(all.negotiate_webtransport_draft(&none), None);
+        assert!(!none.enable_webtransport());
+
+        let old = local(&[Draft02, Draft07]);
+        assert_eq!(old.negotiate_webtransport_draft(&hybrid), Some(Draft07));
+        assert_eq!(old.negotiate_webtransport_draft(&latest), None);
     }
 }

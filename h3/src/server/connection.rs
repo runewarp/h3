@@ -112,6 +112,21 @@ where
     ) -> Poll<Result<Option<C::BidiStream>, ConnectionError>> {
         self.poll_accept_request_stream_internal(cx)
     }
+
+    /// Polls the Connection until the peer's SETTINGS frame has been received.
+    ///
+    /// Extensions negotiated through SETTINGS, such as WebTransport, need to wait for it before
+    /// handling a request, as a request can arrive before the control stream.
+    #[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+    pub fn poll_peer_settings(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        while self.inner.shared.peer_settings().is_none() {
+            ready!(self.poll_next_control(cx))?;
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl<C, B> Connection<C, B>

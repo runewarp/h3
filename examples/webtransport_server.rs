@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use h3::{
-    ext::Protocol,
+    ext::{Protocol, WebTransportDraft},
     quic::{self},
     server::Connection,
 };
@@ -28,6 +28,25 @@ struct Opt {
 
     #[structopt(flatten)]
     pub certs: Certs,
+
+    #[structopt(
+        long,
+        use_delimiter = true,
+        default_value = "02,07,13,15",
+        parse(try_from_str = parse_draft),
+        help = "WebTransport drafts to advertise: 02, 07, 13 and/or 15"
+    )]
+    pub drafts: Vec<WebTransportDraft>,
+}
+
+fn parse_draft(s: &str) -> Result<WebTransportDraft, String> {
+    Ok(match s {
+        "02" => WebTransportDraft::Draft02,
+        "07" => WebTransportDraft::Draft07,
+        "13" => WebTransportDraft::Draft13,
+        "15" => WebTransportDraft::Draft15,
+        _ => return Err(format!("unknown WebTransport draft {s}")),
+    })
 }
 
 #[derive(StructOpt, Debug)]
@@ -73,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Opt: {opt:#?}");
     let Certs { cert, key } = opt.certs;
+    let drafts = opt.drafts;
 
     // create quinn server endpoint and bind UDP socket
 
@@ -107,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(new_conn) = endpoint.accept().await {
         trace_span!("New connection being attempted");
 
+        let drafts = drafts.clone();
         tokio::spawn(async move {
             match new_conn.await {
                 Ok(conn) => {
@@ -116,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .enable_extended_connect(true)
                         .enable_datagram(true)
                         .max_webtransport_sessions(1)
+                        .webtransport_drafts(drafts)
                         .send_grease(true)
                         .build(h3_quinn::Connection::new(conn))
                         .await
@@ -171,12 +193,17 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
 
                 let ext = req.extensions();
                 match req.method() {
-                    &Method::CONNECT if ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT) => {
+                    &Method::CONNECT
+                        if ext.get::<Protocol>().is_some_and(Protocol::is_webtransport) =>
+                    {
                         tracing::info!("Peer wants to initiate a webtransport session");
 
                         tracing::info!("Handing over connection to WebTransport");
                         let session = WebTransportSession::accept(req, stream, conn).await?;
-                        tracing::info!("Established webtransport session");
+                        tracing::info!(
+                            "Established webtransport session using {:?}",
+                            session.draft()
+                        );
                         // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
                         // h3_conn needs to hand over the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
                         handle_session_and_echo_all_inbound_messages(session).await?;

@@ -389,8 +389,6 @@ fn simple_frame_encode<B: BufMut>(ty: FrameType, id: VarInt, buf: &mut B) {
 pub struct SettingId(pub u64);
 
 impl SettingId {
-    const NONE: SettingId = SettingId(0);
-
     /// returns a SettingId type with random number of the 0x1f * N + 0x21
     /// format within the range of the Varint implementation
     pub fn grease() -> Self {
@@ -406,6 +404,9 @@ impl SettingId {
                 | SettingId::ENABLE_CONNECT_PROTOCOL
                 | SettingId::ENABLE_WEBTRANSPORT
                 | SettingId::WEBTRANSPORT_MAX_SESSIONS
+                | SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07
+                | SettingId::WT_MAX_SESSIONS
+                | SettingId::WT_ENABLED
                 | SettingId::H3_DATAGRAM,
         )
     }
@@ -454,30 +455,34 @@ setting_identifiers! {
     // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2
     H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC= 0xFFD277,
 
+    // Drafts 04 to 06
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
+    // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-07#section-8.2
+    WEBTRANSPORT_MAX_SESSIONS_DRAFT07 = 0xc671706a,
+    // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-13#section-9.2
+    WT_MAX_SESSIONS = 0x14e9cd29,
+    // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-15#section-9.2
+    WT_ENABLED = 0x2c7cf000,
 }
 
-const SETTINGS_LEN: usize = 8;
+/// Upper bound on the entries of a SETTINGS frame, sent or received.
+///
+/// Received settings only store identifiers that are supported (and each at most once), so this
+/// must be at least the number of supported identifiers or a peer sending all of them would be
+/// rejected. Sent settings also include one grease setting.
+const SETTINGS_LEN: usize = 16;
 
-#[derive(Debug, PartialEq)]
+// The entries are on the heap so that a SETTINGS frame, which is rare, does not grow the size of
+// every `Frame`.
+#[derive(Debug, PartialEq, Default)]
 pub struct Settings {
-    entries: [(SettingId, u64); SETTINGS_LEN],
-    len: usize,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            entries: [(SettingId::NONE, 0); SETTINGS_LEN],
-            len: 0,
-        }
-    }
+    entries: Vec<(SettingId, u64)>,
 }
 
 impl FrameHeader for Settings {
     const TYPE: FrameType = FrameType::SETTINGS;
     fn len(&self) -> usize {
-        self.entries[..self.len].iter().fold(0, |len, (id, val)| {
+        self.entries.iter().fold(0, |len, (id, val)| {
             len + VarInt::from_u64(id.0).unwrap().size() + VarInt::from_u64(*val).unwrap().size()
         })
     }
@@ -485,21 +490,22 @@ impl FrameHeader for Settings {
 
 impl Settings {
     pub const MAX_ENCODED_SIZE: usize = SETTINGS_LEN * 2 * VarInt::MAX_SIZE;
+    /// Including the frame type and length
+    pub const MAX_FRAME_ENCODED_SIZE: usize = Self::MAX_ENCODED_SIZE + 2 * VarInt::MAX_SIZE;
 
     pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
-        if self.len >= self.entries.len() {
+        if self.entries.len() >= SETTINGS_LEN {
             return Err(SettingsError::Exceeded);
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
         //# The same setting identifier MUST NOT occur more than once in the
         //# SETTINGS frame.
-        if self.entries[..self.len].iter().any(|(i, _)| *i == id) {
+        if self.entries.iter().any(|(i, _)| *i == id) {
             return Err(SettingsError::Repeated(id));
         }
 
-        self.entries[self.len] = (id, value);
-        self.len += 1;
+        self.entries.push((id, value));
         Ok(())
     }
 
@@ -514,7 +520,7 @@ impl Settings {
 
     pub(crate) fn encode<T: BufMut>(&self, buf: &mut T) {
         self.encode_header(buf);
-        for (id, val) in self.entries[..self.len].iter() {
+        for (id, val) in self.entries.iter() {
             id.encode(buf);
             buf.write_var(*val);
         }
@@ -657,40 +663,67 @@ mod tests {
         assert_eq!(check_frame, decoded);
     }
 
+    fn settings(entries: &[(SettingId, u64)]) -> Settings {
+        let mut settings = Settings::default();
+        for (id, value) in entries {
+            settings.insert(*id, *value).unwrap();
+        }
+        settings
+    }
+
     #[test]
     fn settings_frame() {
         codec_frame_check(
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    (SettingId(95), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 4,
-            }),
+            Frame::Settings(settings(&[
+                (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
+                (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+                (SettingId(95), 0),
+            ])),
             &[
                 4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
             ],
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    // check without the Grease setting because this is ignored
-                    (SettingId(0), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 3,
-            }),
+            // check without the Grease setting because this is ignored
+            Frame::Settings(settings(&[
+                (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
+                (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+            ])),
         );
+    }
+
+    #[test]
+    fn settings_frame_with_every_supported_setting() {
+        let supported = [
+            SettingId::QPACK_MAX_TABLE_CAPACITY,
+            SettingId::QPACK_MAX_BLOCKED_STREAMS,
+            SettingId::MAX_HEADER_LIST_SIZE,
+            SettingId::ENABLE_CONNECT_PROTOCOL,
+            SettingId::H3_DATAGRAM,
+            SettingId::ENABLE_WEBTRANSPORT,
+            SettingId::WEBTRANSPORT_MAX_SESSIONS,
+            SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07,
+            SettingId::WT_MAX_SESSIONS,
+            SettingId::WT_ENABLED,
+        ];
+        assert!(supported.iter().all(|id| id.is_supported()));
+
+        // Every supported setting plus unsupported ones, as sent by e.g. Safari
+        let mut buf = Vec::new();
+        for id in supported {
+            id.encode(&mut buf);
+            buf.write_var(1);
+        }
+        for id in [0x2b61, 0x2b64, 0x2b65, 0xffd277, 0x21, 0x40] {
+            SettingId(id).encode(&mut buf);
+            buf.write_var(1);
+        }
+
+        let decoded = Settings::decode(&mut Cursor::new(&buf)).unwrap();
+        for id in supported {
+            assert_eq!(decoded.get(id), Some(1), "{id:?}");
+        }
+        assert_eq!(decoded.get(SettingId(0x2b61)), None);
     }
 
     #[test]
