@@ -45,6 +45,21 @@ impl Decode for SessionId {
 
 impl From<StreamId> for SessionId {
     fn from(value: StreamId) -> Self {
-        Self(value.index())
+        Self(value.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_id_is_the_connect_stream_id() {
+        for id in [0, 4, 8, 400] {
+            let stream_id = StreamId::try_from(id).unwrap();
+            let session_id = SessionId::from(stream_id);
+            assert_eq!(session_id.into_inner(), id);
+            assert_eq!(StreamId::from(session_id), stream_id);
+        }
     }
 }
