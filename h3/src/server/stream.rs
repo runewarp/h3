@@ -60,6 +60,17 @@ impl<S, B> ConnectionState for RequestStream<S, B> {
 
 impl<S, B> CloseStream for RequestStream<S, B> {}
 
+impl<S, B> RequestStream<S, B> {
+    /// Stops [`RequestStream::finish`] from sending a grease frame on this stream.
+    ///
+    /// For extensions that exchange their own data on the stream, such as WebTransport, where
+    /// some peers mishandle frames of unknown types.
+    #[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+    pub fn disable_grease(&mut self) {
+        self.inner.disable_grease();
+    }
+}
+
 impl<S, B> RequestStream<S, B>
 where
     S: quic::RecvStream,

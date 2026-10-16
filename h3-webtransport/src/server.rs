@@ -220,6 +220,9 @@ where
         let session_id = connect_stream_id.into();
         let conn_inner = &mut conn.inner.conn;
         let opener = Mutex::new(conn_inner.opener());
+        // Safari 26 crashes its network process when a frame of an unknown type, such as the
+        // grease frame h3 sends when finishing a stream, follows a WT_CLOSE_SESSION capsule.
+        stream.disable_grease();
         let (send, recv) = stream.split();
 
         Ok(Self {
@@ -327,6 +330,9 @@ where
     /// The message is truncated to 1024 bytes. Streams of the session are reset with
     /// [`WT_SESSION_GONE`](crate::WT_SESSION_GONE) and no new streams can be opened. Does nothing
     /// if the session has already terminated.
+    ///
+    /// Await [`Self::closed`] before dropping the session: dropping it closes the connection,
+    /// which can lose the close.
     pub async fn close(&self, code: u32, reason: &str) -> Result<(), StreamError>
     where
         B: From<Bytes>,
@@ -388,7 +394,14 @@ where
             .expect("session has terminated")
             .clone();
 
-        // Close our side of the CONNECT stream in response, unless we closed the session.
+        // After a close from the server, wait for the client to close its side of the CONNECT
+        // stream. After a close from the client, we have stopped reading it.
+        //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
+        //# To avoid this, the endpoint SHOULD wait until all CONNECT streams have
+        //# been closed by the peer before sending the CONNECTION_CLOSE
+        poll_fn(|cx| self.poll_connect_stream_end(cx)).await;
+
+        // Then close our side in response, unless we closed the session.
         let mut send = self.connect_send.lock().await;
         if !send.closed {
             send.closed = true;
@@ -404,12 +417,6 @@ where
                 }
             }
         }
-        drop(send);
-
-        //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
-        //# To avoid this, the endpoint SHOULD wait until all CONNECT streams have
-        //# been closed by the peer before sending the CONNECTION_CLOSE
-        poll_fn(|cx| self.poll_connect_stream_end(cx)).await;
 
         outcome
     }
