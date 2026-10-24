@@ -112,9 +112,14 @@ pub async fn setup_with(
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![b"h3".to_vec()];
     let mut client = quinn::Endpoint::client((Ipv6Addr::UNSPECIFIED, 0).into()).unwrap();
-    client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(client_crypto).unwrap(),
-    )));
+    let mut client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(1_u32.into());
+    // Three HTTP/3 control/QPACK streams leave room for one WebTransport uni stream.
+    transport.max_concurrent_uni_streams(4_u32.into());
+    client_config.transport_config(Arc::new(transport));
+    client.set_default_client_config(client_config);
     let conn = client.connect(addr, "localhost").unwrap().await.unwrap();
 
     let (mut driver, mut send_request) = h3::client::builder()

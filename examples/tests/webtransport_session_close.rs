@@ -278,3 +278,38 @@ async fn closed_waits_for_the_client_to_close_the_connect_stream() {
     .await
     .expect("WebTransport test timed out");
 }
+
+#[tokio::test]
+async fn opens_blocked_on_stream_credit_wake_when_the_session_closes() {
+    timeout(TIMEOUT, async {
+        let mut setup = setup().await;
+        // The raw peer holds its streams open without the stock h3 client's bidi rejection.
+        setup.driver.0.abort();
+        let _ = (&mut setup.driver.0).await;
+        let id = setup.session.session_id();
+        let _bidi = setup.session.open_bi(id).await.unwrap();
+        let _uni = setup.session.open_uni(id).await.unwrap();
+
+        let session = setup.session.clone();
+        let bidi = tokio::spawn(async move { session.open_bi(id).await.map(|_| ()) });
+        let session = setup.session.clone();
+        let uni = tokio::spawn(async move { session.open_uni(id).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!bidi.is_finished());
+        assert!(!uni.is_finished());
+
+        setup.session.close(0, "done").await.unwrap();
+        assert!(timeout(Duration::from_millis(500), bidi)
+            .await
+            .expect("blocked bidi open did not wake on close")
+            .unwrap()
+            .is_err());
+        assert!(timeout(Duration::from_millis(500), uni)
+            .await
+            .expect("blocked uni open did not wake on close")
+            .unwrap()
+            .is_err());
+    })
+    .await
+    .expect("WebTransport open/close test timed out");
+}

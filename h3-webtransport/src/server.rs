@@ -652,7 +652,15 @@ where
                     }
                     let mut opener = (*p.opener).lock().unwrap();
                     // Open the stream first
-                    let res = ready!(opener.poll_open_bidi(cx))
+                    let res = opener.poll_open_bidi(cx);
+                    if res.is_pending() {
+                        p.session.register(cx.waker());
+                        // Closing the session must also wake opens waiting for QUIC credit.
+                        if p.session.is_terminated() {
+                            return Poll::Ready(Err(session_terminated()));
+                        }
+                    }
+                    let res = ready!(res)
                         .map_err(|err| p.stream_handler.handle_quic_stream_error(err))?;
                     let stream =
                         BidiStream::with_session(BufRecvStream::new(res), (*p.session).clone());
@@ -703,7 +711,14 @@ where
                         return Poll::Ready(Err(session_terminated()));
                     }
                     let mut opener = (*p.opener).lock().unwrap();
-                    let send = ready!(opener.poll_open_send(cx))
+                    let send = opener.poll_open_send(cx);
+                    if send.is_pending() {
+                        p.session.register(cx.waker());
+                        if p.session.is_terminated() {
+                            return Poll::Ready(Err(session_terminated()));
+                        }
+                    }
+                    let send = ready!(send)
                         .map_err(|err| p.stream_handler.handle_quic_stream_error(err))?;
                     let send = BufRecvStream::new(send);
                     let send = SendStream::with_session(send, (*p.session).clone());
