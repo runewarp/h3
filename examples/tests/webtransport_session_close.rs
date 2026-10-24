@@ -313,3 +313,30 @@ async fn opens_blocked_on_stream_credit_wake_when_the_session_closes() {
     .await
     .expect("WebTransport open/close test timed out");
 }
+
+#[tokio::test]
+async fn cancelling_closed_releases_the_waiting_task() {
+    timeout(TIMEOUT, async {
+        struct WaitingTask(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for WaitingTask {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let setup = setup().await;
+        let task = std::sync::Arc::new(WaitingTask(std::sync::atomic::AtomicUsize::new(0)));
+        {
+            let waker = std::task::Waker::from(task.clone());
+            let mut cx = std::task::Context::from_waker(&waker);
+            let mut closed = Box::pin(setup.session.closed());
+            assert!(std::future::Future::poll(closed.as_mut(), &mut cx).is_pending());
+        }
+        // A long-lived session must not retain every cancelled closed() caller.
+        assert_eq!(std::sync::Arc::strong_count(&task), 1);
+        setup.session.close(0, "done").await.unwrap();
+        assert_eq!(task.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    })
+    .await
+    .expect("WebTransport cancelled-waiter test timed out");
+}

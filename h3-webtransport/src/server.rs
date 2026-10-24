@@ -35,7 +35,7 @@ use pin_project_lite::pin_project;
 
 use crate::{
     capsule::{self, Capsule, CapsuleReader},
-    state::SessionState,
+    state::{Registration, SessionState},
     stream::{BidiStream, RecvStream, SendStream},
 };
 
@@ -296,6 +296,7 @@ where
             stream: None,
             session_id,
             session: &self.state,
+            registration: None,
             stream_handler: WTransportStreamHandler {
                 shared: self.shared.clone(),
             },
@@ -309,6 +310,7 @@ where
             stream: None,
             session_id,
             session: &self.state,
+            registration: None,
             stream_handler: WTransportStreamHandler {
                 shared: self.shared.clone(),
             },
@@ -387,7 +389,9 @@ where
     ///
     /// Closes from the client are only noticed while this or [`Self::draining`] is being polled.
     pub async fn closed(&self) -> Result<CloseInfo, SessionError> {
-        poll_fn(|cx| self.poll_connect_stream(cx, SessionState::is_terminated)).await;
+        let mut registration = None;
+        poll_fn(|cx| self.poll_connect_stream(cx, SessionState::is_terminated, &mut registration))
+            .await;
         let outcome = self
             .state
             .outcome()
@@ -399,7 +403,7 @@ where
         //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
         //# To avoid this, the endpoint SHOULD wait until all CONNECT streams have
         //# been closed by the peer before sending the CONNECTION_CLOSE
-        poll_fn(|cx| self.poll_connect_stream_end(cx)).await;
+        poll_fn(|cx| self.poll_connect_stream_end(cx, &mut registration)).await;
 
         // Then close our side in response, unless we closed the session.
         let mut send = self.connect_send.lock().await;
@@ -422,8 +426,12 @@ where
     }
 
     /// Discards data on the CONNECT stream until the client finishes or resets it.
-    fn poll_connect_stream_end(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.state.register(cx.waker());
+    fn poll_connect_stream_end(
+        &self,
+        cx: &mut Context<'_>,
+        registration: &mut Registration,
+    ) -> Poll<()> {
+        self.state.register(cx.waker(), registration);
         let waker = self.state.waker();
         let mut stream_cx = Context::from_waker(&waker);
 
@@ -439,8 +447,13 @@ where
 
     /// Waits until the client asks to close the session gracefully, or the session terminates.
     pub async fn draining(&self) {
+        let mut registration = None;
         poll_fn(|cx| {
-            self.poll_connect_stream(cx, |state| state.is_draining() || state.is_terminated())
+            self.poll_connect_stream(
+                cx,
+                |state| state.is_draining() || state.is_terminated(),
+                &mut registration,
+            )
         })
         .await
     }
@@ -450,10 +463,11 @@ where
         &self,
         cx: &mut Context<'_>,
         done: impl Fn(&SessionState) -> bool,
+        registration: &mut Registration,
     ) -> Poll<()> {
         // Every task waiting on the session is woken when the CONNECT stream has data, not only
         // the one polling it.
-        self.state.register(cx.waker());
+        self.state.register(cx.waker(), registration);
         let waker = self.state.waker();
         let mut stream_cx = Context::from_waker(&waker);
 
@@ -609,6 +623,7 @@ pin_project! {
         stream: Option<PendingStreams<C,B>>,
         session_id: SessionId,
         session: &'a Arc<SessionState>,
+        registration: Registration,
         stream_handler: WTransportStreamHandler,
     }
 }
@@ -654,7 +669,7 @@ where
                     // Open the stream first
                     let res = opener.poll_open_bidi(cx);
                     if res.is_pending() {
-                        p.session.register(cx.waker());
+                        p.session.register(cx.waker(), p.registration);
                         // Closing the session must also wake opens waiting for QUIC credit.
                         if p.session.is_terminated() {
                             return Poll::Ready(Err(session_terminated()));
@@ -681,6 +696,7 @@ pin_project! {
         // Future for opening a uni stream
         session_id: SessionId,
         session: &'a Arc<SessionState>,
+        registration: Registration,
         stream_handler: WTransportStreamHandler
     }
 }
@@ -713,7 +729,7 @@ where
                     let mut opener = (*p.opener).lock().unwrap();
                     let send = opener.poll_open_send(cx);
                     if send.is_pending() {
-                        p.session.register(cx.waker());
+                        p.session.register(cx.waker(), p.registration);
                         if p.session.is_terminated() {
                             return Poll::Ready(Err(session_terminated()));
                         }

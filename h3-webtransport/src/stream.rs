@@ -11,7 +11,7 @@ use h3::{
 };
 use tokio::io::ReadBuf;
 
-use crate::state::{SessionState, WT_SESSION_GONE};
+use crate::state::{Registration, SessionState, WT_SESSION_GONE};
 
 /// Aborts a stream once its session has terminated.
 ///
@@ -25,6 +25,7 @@ use crate::state::{SessionState, WT_SESSION_GONE};
 // are woken when the session terminates.
 struct SessionGuard<S, B> {
     session: Option<Arc<SessionState>>,
+    registration: Registration,
     /// Resets the send side and/or stops the receive side, depending on the stream type
     abort: fn(&mut BufRecvStream<S, B>),
     aborted: bool,
@@ -34,6 +35,7 @@ impl<S, B> SessionGuard<S, B> {
     fn new(session: Option<Arc<SessionState>>, abort: fn(&mut BufRecvStream<S, B>)) -> Self {
         Self {
             session,
+            registration: None,
             abort,
             aborted: false,
         }
@@ -69,7 +71,7 @@ impl<S, B> SessionGuard<S, B> {
         let result = poll(stream, cx);
         if result.is_pending() {
             if let Some(session) = &self.session {
-                session.register(cx.waker());
+                session.register(cx.waker(), &mut self.registration);
                 // The session may have terminated before the waker was registered.
                 if self.is_gone(stream) {
                     return Poll::Ready(Err(gone()));
@@ -83,6 +85,7 @@ impl<S, B> SessionGuard<S, B> {
     fn half<T>(&self, abort: fn(&mut BufRecvStream<T, B>)) -> SessionGuard<T, B> {
         SessionGuard {
             session: self.session.clone(),
+            registration: None,
             abort,
             aborted: self.aborted,
         }

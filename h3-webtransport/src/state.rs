@@ -4,12 +4,15 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
     },
     task::{Wake, Waker},
 };
 
 use h3::error::StreamError;
+
+/// Owned by the waiting future or stream, so cancellation releases its task's waker.
+pub(crate) type Registration = Option<Arc<Waker>>;
 
 /// The `WT_SESSION_GONE` HTTP/3 error code (`H3_WEBTRANSPORT_SESSION_GONE` before draft 07).
 ///
@@ -88,8 +91,8 @@ impl SessionState {
     ///
     /// Callers check the state again after registering, since it may have changed before the
     /// waker was registered.
-    pub(crate) fn register(&self, waker: &Waker) {
-        self.wakers.register(waker);
+    pub(crate) fn register(&self, waker: &Waker, registration: &mut Registration) {
+        self.wakers.register(waker, registration);
     }
 
     /// A waker that wakes every registered waker.
@@ -102,20 +105,30 @@ impl SessionState {
 }
 
 #[derive(Debug, Default)]
-struct WakerSet(Mutex<Vec<Waker>>);
+struct WakerSet(Mutex<Vec<Weak<Waker>>>);
 
 impl WakerSet {
-    fn register(&self, waker: &Waker) {
+    fn register(&self, waker: &Waker, registration: &mut Registration) {
+        if !registration
+            .as_ref()
+            .is_some_and(|registered| registered.will_wake(waker))
+        {
+            *registration = Some(Arc::new(waker.clone()));
+        }
+        let registration = Arc::downgrade(registration.as_ref().unwrap());
         let mut wakers = self.0.lock().unwrap();
-        if !wakers.iter().any(|w| w.will_wake(waker)) {
-            wakers.push(waker.clone());
+        // Keep at most one entry per live waiter. Completed or cancelled callers own no waker
+        // here, even if the session never closes or drains.
+        wakers.retain(|waker| waker.strong_count() > 0);
+        if !wakers.iter().any(|waker| waker.ptr_eq(&registration)) {
+            wakers.push(registration);
         }
     }
 
     fn wake_all(&self) {
         let wakers = std::mem::take(&mut *self.0.lock().unwrap());
-        for waker in wakers {
-            waker.wake();
+        for waker in wakers.into_iter().filter_map(|waker| waker.upgrade()) {
+            waker.wake_by_ref();
         }
     }
 }
