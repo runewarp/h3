@@ -1,6 +1,7 @@
 //! State of a WebTransport session shared with its streams.
 
 use std::{
+    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,10 +10,11 @@ use std::{
     task::{Wake, Waker},
 };
 
+use futures_util::task::AtomicWaker;
 use h3::error::StreamError;
 
 /// Owned by the waiting future or stream, so cancellation releases its task's waker.
-pub(crate) type Registration = Option<Arc<Waker>>;
+pub(crate) type Registration = Option<Arc<RegisteredWaker>>;
 
 /// The `WT_SESSION_GONE` HTTP/3 error code (`H3_WEBTRANSPORT_SESSION_GONE` before draft 07).
 ///
@@ -56,6 +58,8 @@ pub(crate) struct SessionState {
     draining: AtomicBool,
     /// Tasks to wake when the session terminates or starts draining
     wakers: Arc<WakerSet>,
+    /// Only CONNECT readers are woken for incoming capsule bytes.
+    connect_wakers: Arc<WakerSet>,
 }
 
 impl SessionState {
@@ -73,6 +77,7 @@ impl SessionState {
         let first = self.outcome.set(outcome).is_ok();
         if first {
             self.wakers.wake_all();
+            self.connect_wakers.wake_all();
         }
         first
     }
@@ -84,6 +89,7 @@ impl SessionState {
     pub(crate) fn drain(&self) {
         if !self.draining.swap(true, Ordering::AcqRel) {
             self.wakers.wake_all();
+            self.connect_wakers.wake_all();
         }
     }
 
@@ -95,40 +101,65 @@ impl SessionState {
         self.wakers.register(waker, registration);
     }
 
-    /// A waker that wakes every registered waker.
-    ///
-    /// Used when polling the CONNECT stream, so that whichever task polls it, all tasks waiting on
-    /// the session are woken when something arrives.
-    pub(crate) fn waker(&self) -> Waker {
-        Waker::from(self.wakers.clone())
+    pub(crate) fn register_connect(&self, waker: &Waker, registration: &mut Registration) {
+        self.connect_wakers.register(waker, registration);
+    }
+
+    /// Incoming CONNECT data wakes readers, not idle streams or credit-blocked opens.
+    pub(crate) fn connect_waker(&self) -> Waker {
+        Waker::from(self.connect_wakers.clone())
     }
 }
 
 #[derive(Debug, Default)]
-struct WakerSet(Mutex<Vec<Weak<Waker>>>);
+struct WakerSet(Mutex<HashMap<usize, Weak<RegisteredWaker>>>);
+
+/// The waiter owns its entry; dropping it releases the task waker and removes the entry.
+#[derive(Debug)]
+pub(crate) struct RegisteredWaker {
+    waker: AtomicWaker,
+    set: Weak<WakerSet>,
+}
+
+impl Drop for RegisteredWaker {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.upgrade() {
+            set.0
+                .lock()
+                .unwrap()
+                .remove(&(self as *const Self as usize));
+        }
+    }
+}
 
 impl WakerSet {
-    fn register(&self, waker: &Waker, registration: &mut Registration) {
-        if !registration
-            .as_ref()
-            .is_some_and(|registered| registered.will_wake(waker))
-        {
-            *registration = Some(Arc::new(waker.clone()));
-        }
-        let registration = Arc::downgrade(registration.as_ref().unwrap());
-        let mut wakers = self.0.lock().unwrap();
-        // Keep at most one entry per live waiter. Completed or cancelled callers own no waker
-        // here, even if the session never closes or drains.
-        wakers.retain(|waker| waker.strong_count() > 0);
-        if !wakers.iter().any(|waker| waker.ptr_eq(&registration)) {
-            wakers.push(registration);
-        }
+    fn register(self: &Arc<Self>, waker: &Waker, registration: &mut Registration) {
+        let entry = registration.get_or_insert_with(|| {
+            let entry = Arc::new(RegisteredWaker {
+                waker: AtomicWaker::new(),
+                set: Arc::downgrade(self),
+            });
+            self.0
+                .lock()
+                .unwrap()
+                .insert(Arc::as_ptr(&entry) as usize, Arc::downgrade(&entry));
+            entry
+        });
+        // Repeated polls update only this waiter's entry, without scanning or locking the set.
+        entry.waker.register(waker);
     }
 
     fn wake_all(&self) {
-        let wakers = std::mem::take(&mut *self.0.lock().unwrap());
-        for waker in wakers.into_iter().filter_map(|waker| waker.upgrade()) {
-            waker.wake_by_ref();
+        // Wake outside the lock: a task may drop its registration when woken.
+        let wakers: Vec<_> = self
+            .0
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for entry in wakers {
+            entry.waker.wake();
         }
     }
 }

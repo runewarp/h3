@@ -431,8 +431,8 @@ where
         cx: &mut Context<'_>,
         registration: &mut Registration,
     ) -> Poll<()> {
-        self.state.register(cx.waker(), registration);
-        let waker = self.state.waker();
+        self.state.register_connect(cx.waker(), registration);
+        let waker = self.state.connect_waker();
         let mut stream_cx = Context::from_waker(&waker);
 
         let mut recv = self.connect_recv.lock().unwrap();
@@ -465,10 +465,10 @@ where
         done: impl Fn(&SessionState) -> bool,
         registration: &mut Registration,
     ) -> Poll<()> {
-        // Every task waiting on the session is woken when the CONNECT stream has data, not only
-        // the one polling it.
-        self.state.register(cx.waker(), registration);
-        let waker = self.state.waker();
+        // Both closed() and draining() may drive CONNECT reads. Wake those readers together,
+        // leaving streams and open futures asleep until the session changes.
+        self.state.register_connect(cx.waker(), registration);
+        let waker = self.state.connect_waker();
         let mut stream_cx = Context::from_waker(&waker);
 
         let mut recv = self.connect_recv.lock().unwrap();

@@ -340,3 +340,94 @@ async fn cancelling_closed_releases_the_waiting_task() {
     .await
     .expect("WebTransport cancelled-waiter test timed out");
 }
+
+#[tokio::test]
+async fn unknown_capsules_do_not_wake_idle_streams() {
+    timeout(TIMEOUT, async {
+        use h3::quic::RecvStream;
+        use h3_webtransport::server::AcceptedBi;
+        use std::{
+            future::Future,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            task::{Context, Wake, Waker},
+        };
+
+        #[derive(Default)]
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut setup = setup().await;
+        let mut peer_streams = Vec::new();
+        let mut streams = Vec::new();
+        let stream_wakes = Arc::new(CountWake::default());
+        let stream_waker = Waker::from(stream_wakes.clone());
+        for _ in 0..50 {
+            let (mut send, recv) = setup.connection.open_bi().await.unwrap();
+            // WebTransport bidi signal 0x41 and CONNECT stream ID 4.
+            send.write_all(b"\x40\x41\x04").await.unwrap();
+            peer_streams.push((send, recv));
+            let resolver = setup.session.accept_bi().await.unwrap().unwrap();
+            let AcceptedBi::BidiStream(_, mut stream) = resolver.resolve().await.unwrap() else {
+                panic!("expected a WebTransport stream");
+            };
+            assert!(stream
+                .poll_data(&mut Context::from_waker(&stream_waker))
+                .is_pending());
+            streams.push(stream);
+        }
+
+        let reader_wakes = Arc::new(CountWake::default());
+        let reader_waker = Waker::from(reader_wakes.clone());
+        let mut closed = Box::pin(setup.session.closed());
+        assert!(closed
+            .as_mut()
+            .poll(&mut Context::from_waker(&reader_waker))
+            .is_pending());
+        stream_wakes.0.store(0, Ordering::SeqCst);
+        for _ in 0..20 {
+            let before = reader_wakes.0.load(Ordering::SeqCst);
+            setup
+                .stream
+                .send_data(common::capsule(0x1234, b"ignored"))
+                .await
+                .unwrap();
+            while reader_wakes.0.load(Ordering::SeqCst) == before {
+                tokio::task::yield_now().await;
+            }
+            assert!(closed
+                .as_mut()
+                .poll(&mut Context::from_waker(&reader_waker))
+                .is_pending());
+            for stream in &mut streams {
+                assert!(stream
+                    .poll_data(&mut Context::from_waker(&stream_waker))
+                    .is_pending());
+            }
+        }
+        assert_eq!(
+            stream_wakes.0.load(Ordering::SeqCst),
+            0,
+            "unknown capsules woke idle streams"
+        );
+        drop(closed);
+
+        // Separating reader wakeups must preserve termination wakeups for every stream.
+        setup.session.close(0, "done").await.unwrap();
+        assert_eq!(stream_wakes.0.load(Ordering::SeqCst), streams.len());
+        for stream in &mut streams {
+            assert!(matches!(
+                stream.poll_data(&mut Context::from_waker(&stream_waker)),
+                std::task::Poll::Ready(Err(_))
+            ));
+        }
+    })
+    .await
+    .expect("WebTransport capsule wakeup test timed out");
+}
