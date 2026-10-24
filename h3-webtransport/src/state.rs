@@ -36,6 +36,8 @@ pub struct CloseInfo {
 pub enum SessionError {
     /// The peer sent an invalid capsule, so the CONNECT stream was reset with H3_MESSAGE_ERROR
     MalformedCapsule(&'static str),
+    /// The extension driver or session owner was dropped before orderly CONNECT completion
+    OwnerDropped,
     /// The CONNECT stream failed, for example because the peer reset it or the connection closed
     Stream(Arc<StreamError>),
 }
@@ -43,6 +45,7 @@ pub enum SessionError {
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            SessionError::OwnerDropped => write!(f, "WebTransport owner dropped"),
             SessionError::MalformedCapsule(reason) => write!(f, "malformed capsule: {reason}"),
             SessionError::Stream(err) => write!(f, "CONNECT stream failed: {err}"),
         }
@@ -112,7 +115,7 @@ impl SessionState {
 }
 
 #[derive(Debug, Default)]
-struct WakerSet(Mutex<HashMap<usize, Weak<RegisteredWaker>>>);
+pub(crate) struct WakerSet(Mutex<HashMap<usize, Weak<RegisteredWaker>>>);
 
 /// The waiter owns its entry; dropping it releases the task waker and removes the entry.
 #[derive(Debug)]
@@ -133,7 +136,7 @@ impl Drop for RegisteredWaker {
 }
 
 impl WakerSet {
-    fn register(self: &Arc<Self>, waker: &Waker, registration: &mut Registration) {
+    pub(crate) fn register(self: &Arc<Self>, waker: &Waker, registration: &mut Registration) {
         let entry = registration.get_or_insert_with(|| {
             let entry = Arc::new(RegisteredWaker {
                 waker: AtomicWaker::new(),
@@ -149,7 +152,7 @@ impl WakerSet {
         entry.waker.register(waker);
     }
 
-    fn wake_all(&self) {
+    pub(crate) fn wake_all(&self) {
         // Wake outside the lock: a task may drop its registration when woken.
         let wakers: Vec<_> = self
             .0

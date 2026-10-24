@@ -6,6 +6,8 @@
 #![deny(missing_docs)]
 
 mod capsule;
+/// Client side WebTransport sessions and connection driver
+pub mod client;
 /// Server side WebTransport session support
 pub mod server;
 mod state;
