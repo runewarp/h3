@@ -580,7 +580,7 @@ async fn exact_client_stream_ids_reject_wrong_stale_and_malformed_prefixes() {
         assert_eq!(two.session_id(),h3_webtransport::SessionId::try_from(8).unwrap());
         // Slow prefix remains independent of ordinary intake and complete prefixes.
         let (mut slow_send,mut slow_recv)=pair.cq.open_bi().await.unwrap();slow_send.write_all(&[0x40]).await.unwrap();
-        for bytes in [vec![0x40,0x41,0],vec![0x40,0x41,12],vec![0x40,0x41,1],vec![0x40,0x41,0x40],vec![0x40,0x42],vec![0x40]] {
+        for bytes in [vec![0x40,0x41,0],vec![0x40,0x41,12],vec![0x40,0x41,1],vec![0x40,0x41,0x40]] {
             let (mut send,mut recv)=pair.cq.open_bi().await.unwrap();send.write_all(&bytes).await.unwrap();send.finish().unwrap();
             assert!(matches!(recv.read_chunk(8,true).await,Err(quinn::ReadError::Reset(code)) if code.into_inner()==h3_webtransport::WT_SESSION_GONE));
         }
@@ -702,6 +702,32 @@ async fn connection_loss_terminates_detached_session_and_credit_opens() {
     })
     .await
     .expect("connection loss test timed out");
+}
+
+#[tokio::test]
+async fn unfinished_request_types_keep_h3_errors_until_wt_is_identified() {
+    timeout(Duration::from_secs(5), async {
+        for flags in [[false; 3], [true; 3]] {
+            let mut pair = Pair::new(server::Limits::default(), 4, WebTransportDraft::Draft07, WebTransportDraft::Draft07, flags).await;
+            for prefix in [vec![], vec![0x40], vec![0x40, 0x42], vec![0x21, 2, 0]] {
+                let (mut send, mut recv) = pair.cq.open_bi().await.unwrap();
+                send.write_all(&prefix).await.unwrap();
+                send.finish().unwrap();
+                assert!(matches!(recv.read_chunk(8, true).await,
+                    Err(quinn::ReadError::Reset(code)) if code.into_inner() == h3::error::Code::H3_REQUEST_INCOMPLETE.value()), "unfinished ordinary prefix {prefix:?}");
+            }
+            // Once 0x41 is identified, missing/truncated/invalid IDs keep WT errors,
+            // including the inherited behavior without WT negotiation.
+            for prefix in [vec![0x40, 0x41], vec![0x40, 0x41, 0x40], vec![0x40, 0x41, 1]] {
+                let (mut send, mut recv) = pair.cq.open_bi().await.unwrap();
+                send.write_all(&prefix).await.unwrap();
+                send.finish().unwrap();
+                assert!(matches!(recv.read_chunk(8, true).await,
+                    Err(quinn::ReadError::Reset(code)) if code.into_inner() == h3_webtransport::WT_SESSION_GONE));
+            }
+            pair.ordinary().await;
+        }
+    }).await.expect("request error stage test timed out");
 }
 
 #[tokio::test]

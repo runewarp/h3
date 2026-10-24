@@ -457,7 +457,16 @@ impl<C: quic::Connection<B, BidiStream: quic::BidiStream<B>>, B: Buf> Future for
             }
             match ready!(stream.poll_read(cx)) {
                 Ok(false) => {}
-                _ => return Poll::Ready(None),
+                Ok(true) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+                    //# If a client-initiated stream terminates without enough of the HTTP
+                    //# message to provide a complete response, the server SHOULD abort its
+                    //# response stream with the error code H3_REQUEST_INCOMPLETE.
+                    abort(stream, Code::H3_REQUEST_INCOMPLETE.value());
+                    this.resolver.take();
+                    return Poll::Ready(None);
+                }
+                Err(_) => return Poll::Ready(None),
             }
         }
         cx.waker().wake_by_ref();
