@@ -421,7 +421,6 @@ async fn response_validation_rejects_status_and_incompatible_headers() {
             (Draft07, 302, None, None),
             (Draft02, 200, None, None),
             (Draft02, 200, Some("draft07"), None),
-            (Draft07, 200, Some("draft02"), None),
             (Draft15, 200, None, Some("unoffered")),
         ] {
             let mut pair = Pair::new(Limits::default(), draft, 4).await;
@@ -472,6 +471,22 @@ async fn each_adopted_draft_selects_its_connect_token_and_header() {
                     request.extensions().get::<h3::ext::Protocol>(),
                     Some(&token)
                 );
+                // Strict draft02 peer: do not accept a CONNECT without its version offer.
+                if draft == WebTransportDraft::Draft02 {
+                    assert_eq!(request.headers()["sec-webtransport-http3-draft02"], "1");
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get_all("sec-webtransport-http3-draft02")
+                            .iter()
+                            .count(),
+                        1
+                    );
+                } else {
+                    assert!(!request
+                        .headers()
+                        .contains_key("sec-webtransport-http3-draft02"));
+                }
                 stream
                     .send_response(response.body(()).unwrap())
                     .await
@@ -920,15 +935,6 @@ async fn invalid_request_tokens_are_rejected() {
                 Err(client::ConnectError::InvalidRequest)
             ));
         }
-        let response = Response::builder()
-            .header("sec-webtransport-http3-draft", "draft02")
-            .header("sec-webtransport-http3-draft", "draft02")
-            .body(())
-            .unwrap();
-        let (result, mut stream) = pair.try_connect_with(response).await;
-        assert!(matches!(result, Err(client::ConnectError::InvalidResponse)));
-        assert!(stream.recv_data().await.is_err());
-        pair.ordinary().await;
     })
     .await
     .expect("CONNECT validation timed out");
@@ -1001,4 +1007,130 @@ async fn successful_connect_ignores_http_response_framing() {
     })
     .await
     .expect("CONNECT framing test timed out");
+}
+
+#[tokio::test]
+async fn later_drafts_ignore_legacy_response_headers() {
+    timeout(Duration::from_secs(5), async {
+        for draft in [
+            WebTransportDraft::Draft07,
+            WebTransportDraft::Draft13,
+            WebTransportDraft::Draft15,
+        ] {
+            for values in [
+                &["draft02"][..],
+                &["obsolete"],
+                &["draft02", "draft02"],
+                &["draft02", "conflict"],
+            ] {
+                let mut pair = Pair::new(Limits::default(), draft, 4).await;
+                let mut response = Response::builder();
+                for value in values {
+                    response = response.header("sec-webtransport-http3-draft", *value);
+                }
+                let (session, mut connect) = pair.connect_with(response.body(()).unwrap()).await;
+                assert_eq!(session.draft(), draft);
+                connect
+                    .send_data(common::close_capsule(7, b"legacy ignored"))
+                    .await
+                    .unwrap();
+                connect.finish().await.unwrap();
+                assert_eq!(session.closed().await.unwrap().code, 7);
+                assert!(connect.recv_data().await.unwrap().is_none());
+                pair.ordinary().await;
+            }
+        }
+    })
+    .await
+    .expect("legacy response header test timed out");
+}
+
+#[tokio::test]
+async fn draft02_preserves_valid_offers_and_rejects_conflicting_offers() {
+    timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::new(Limits::default(), WebTransportDraft::Draft02, 4).await;
+        // SETTINGS arrive before local request validation.
+        pair.ordinary().await;
+        for values in [
+            &["0"][..],
+            &["draft02"],
+            &["1, 1"],
+            &["1", "1"],
+            &["1", "0"],
+        ] {
+            let mut request = Request::builder()
+                .method("CONNECT")
+                .uri("https://localhost/wt");
+            for value in values {
+                request = request.header("sec-webtransport-http3-draft02", *value);
+            }
+            assert!(matches!(
+                pair.client.connect(request.body(()).unwrap()).await,
+                Err(client::ConnectError::InvalidRequest)
+            ));
+            // No CONNECT was sent and no reservation was leaked.
+            pair.ordinary().await;
+        }
+        let request = Request::builder()
+            .method("CONNECT")
+            .uri("https://localhost/wt")
+            .header("sec-webtransport-http3-draft02", "1")
+            .body(())
+            .unwrap();
+        let (session, mut stream) = tokio::join!(pair.client.connect(request), async {
+            let (request, mut stream) = pair
+                .server
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            let offers: Vec<_> = request
+                .headers()
+                .get_all("sec-webtransport-http3-draft02")
+                .iter()
+                .collect();
+            assert_eq!(offers.len(), 1);
+            assert_eq!(offers[0], "1");
+            stream
+                .send_response(
+                    Response::builder()
+                        .header("sec-webtransport-http3-draft", "draft02")
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            stream
+        });
+        let session = session.unwrap();
+        stream.finish().await.unwrap();
+        assert_eq!(session.closed().await.unwrap().code, 0);
+        assert!(stream.recv_data().await.unwrap().is_none());
+        pair.ordinary().await;
+    })
+    .await
+    .expect("draft02 request offer test timed out");
+}
+
+#[tokio::test]
+async fn draft02_rejects_duplicate_response_headers() {
+    timeout(Duration::from_secs(5), async {
+        for second in ["draft02", "draft07"] {
+            let mut pair = Pair::new(Limits::default(), WebTransportDraft::Draft02, 4).await;
+            let response = Response::builder()
+                .header("sec-webtransport-http3-draft", "draft02")
+                .header("sec-webtransport-http3-draft", second)
+                .body(())
+                .unwrap();
+            let (result, mut stream) = pair.try_connect_with(response).await;
+            assert!(matches!(result, Err(client::ConnectError::InvalidResponse)));
+            assert!(stream.recv_data().await.is_err());
+            pair.ordinary().await;
+        }
+    })
+    .await
+    .expect("duplicate draft02 response test timed out");
 }

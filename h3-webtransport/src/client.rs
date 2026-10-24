@@ -392,9 +392,12 @@ where
     /// Establish a session using an HTTPS CONNECT request. The negotiated draft selects the token.
     ///
     /// Authority, path, authorization headers and Origin are supplied by the caller. Any supplied
-    /// `:protocol` must agree with the selected draft. Non-success responses and incompatible
-    /// response headers reset both CONNECT directions. Cancellation while waiting for the response does
-    /// the same and releases the session reservation and queued streams.
+    /// `:protocol` must agree with the selected draft. Draft02 offers are inserted if absent;
+    /// supplied offers must be a single `sec-webtransport-http3-draft02: 1`. Only draft02
+    /// validates the legacy response draft header. Successful CONNECT ignores HTTP framing fields.
+    /// Non-success responses and incompatible response headers reset both CONNECT directions.
+    /// Cancellation while waiting for the response does the same and releases the session
+    /// reservation and queued streams.
     pub async fn connect(
         &mut self,
         mut request: Request<()>,
@@ -427,6 +430,24 @@ where
                 .is_some_and(|p| *p != protocol)
         {
             return Err(ConnectError::InvalidRequest);
+        }
+        if negotiation.draft == WebTransportDraft::Draft02 {
+            // Draft02 section 6 requires this offer on the CONNECT request.
+            // A supplied offer must be a single exact value; do not overwrite conflicts.
+            let mut offers = request
+                .headers()
+                .get_all("sec-webtransport-http3-draft02")
+                .iter();
+            match offers.next() {
+                None => {
+                    request.headers_mut().insert(
+                        "sec-webtransport-http3-draft02",
+                        http::HeaderValue::from_static("1"),
+                    );
+                }
+                Some(value) if value.as_bytes() == b"1" && offers.next().is_none() => {}
+                Some(_) => return Err(ConnectError::InvalidRequest),
+            }
         }
         request.extensions_mut().insert(protocol);
         // connect takes &mut self, so no other establishment can consume this cap meanwhile.
@@ -469,15 +490,18 @@ where
         }
         // RFC 9110 section 9.3.6: ignore Content-Length and Transfer-Encoding on
         // successful CONNECT. H3 passes them through without applying body framing.
-        let draft_headers = response.headers().get_all("sec-webtransport-http3-draft");
-        let mut drafts = draft_headers.iter();
-        let header = drafts.next();
-        if (negotiation.draft == WebTransportDraft::Draft02
-            && header.map(|v| v.as_bytes()) != Some(b"draft02"))
-            || (negotiation.draft != WebTransportDraft::Draft02 && header.is_some())
-            || drafts.next().is_some()
-            || response.headers().contains_key("sec-webtransport-protocol")
-        {
+        // Only draft02 defines this response negotiation. Later groups ignore the
+        // legacy field, including repeated values, rather than interpreting it.
+        if negotiation.draft == WebTransportDraft::Draft02 {
+            let mut drafts = response
+                .headers()
+                .get_all("sec-webtransport-http3-draft")
+                .iter();
+            if drafts.next().map(|v| v.as_bytes()) != Some(b"draft02") || drafts.next().is_some() {
+                return Err(ConnectError::InvalidResponse);
+            }
+        }
+        if response.headers().contains_key("sec-webtransport-protocol") {
             return Err(ConnectError::InvalidResponse);
         }
         if pending.incoming.state.is_terminated() {
