@@ -1,14 +1,27 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use h3::{ext::WebTransportDraft, server::Connection};
+use h3::{
+    error::Code,
+    ext::WebTransportDraft,
+    quic::{RecvStream as _, SendStream as _},
+    server::Connection,
+};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use h3_webtransport::server;
 use http::Method;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Semaphore,
+    task::JoinSet,
+};
+
 use tracing::{error, info, trace_span};
+
+// Generic example budget, including long-lived CONNECT handlers.
+const MAX_REQUEST_HANDLERS: usize = 32;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
@@ -160,9 +173,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // The connection task keeps accepting requests while session tasks open or await streams.
 async fn handle_connection(conn: Connection<h3_quinn::Connection, Bytes>) -> Result<()> {
     let (mut driver, acceptor) = server::new(conn, server::Limits::default());
-    while let Some(resolver) = driver.accept().await? {
+    let budget = Arc::new(Semaphore::new(MAX_REQUEST_HANDLERS));
+    // Dropping the set aborts all request/session handlers on driver loss or error.
+    let mut handlers = JoinSet::new();
+    loop {
+        let mut resolver = tokio::select! {
+            request = driver.accept() => match request? {
+                Some(resolver) => resolver,
+                None => break,
+            },
+            Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                if let Err(error) = result {
+                    error!("Request handler task failed: {error:?}");
+                }
+                continue;
+            }
+        };
+        // Never spawn a task to wait for capacity or block the connection driver on a permit.
+        let Ok(permit) = budget.clone().try_acquire_owned() else {
+            resolver
+                .frame_stream
+                .stream
+                .reset(Code::H3_REQUEST_REJECTED.value());
+            resolver
+                .frame_stream
+                .stream
+                .stop_sending(Code::H3_REQUEST_REJECTED.value());
+            continue;
+        };
         let acceptor = acceptor.clone();
-        tokio::spawn(async move {
+        handlers.spawn(async move {
+            let _permit = permit;
             let result: Result<()> = async {
                 let (request, mut stream) =
                     tokio::time::timeout(Duration::from_secs(10), resolver.resolve_request())
@@ -188,6 +229,7 @@ async fn handle_connection(conn: Connection<h3_quinn::Connection, Bytes>) -> Res
             }
         });
     }
+    handlers.shutdown().await;
     Ok(())
 }
 
@@ -243,3 +285,7 @@ async fn handle_session(session: server::Session<h3_quinn::Connection, Bytes>) -
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/webtransport_server/budget.rs"]
+mod budget_tests;

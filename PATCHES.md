@@ -59,6 +59,8 @@ Post-review request error correction: EOF before identifying WT signal `0x41`, i
 
 Post-review documentation correction removes the obsolete claim that Server detachment is future work and points to the implemented detached API.
 
+Post-review example correction uses an existing Tokio semaphore to reserve one of 32 per-connection handler permits before spawning a resolver task, including long-lived CONNECT handlers. Excess requests receive `H3_REQUEST_REJECTED` without blocking driver intake or spawning permit waiters. A task set reaps completed handlers and aborts outstanding handlers on driver loss/end. A real Quinn example regression saturates admission, verifies WT echo progress while full, releases a stalled resolver, verifies ordinary request recovery and observes connection-loss cleanup. Existing 10-second header, 30-second ordinary request and five-minute session deadlines remain example policy.
+
 ## Compatibility, bounds and cancellation
 
 The generic client driver now requires `C::BidiStream: Send`. This is an accepted compatibility requirement of its independent boxed dispatch futures and applies even to a client not enabling the extension. Quinn satisfies it. Detached Server sessions require a splittable `quic::BidiStream` and a cloneable opener. Each backend opener clone must own independent pending-open state, as Quinn does; sharing one pending future behind a mutex would overwrite waiter wakers. The crate spawns no tasks.
