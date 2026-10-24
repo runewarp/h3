@@ -63,6 +63,10 @@ where
 {
     stream: ConnectRecvStream<C, B>,
     capsules: CapsuleReader,
+    /// A close capsule terminates the session immediately; validate later data through FIN.
+    close_received: bool,
+    /// Retained so repeated closed() calls report trailing data consistently.
+    end_error: Option<SessionError>,
     /// The client finished or reset its side of the CONNECT stream, or we stopped reading it
     ended: bool,
 }
@@ -237,6 +241,8 @@ where
             connect_recv: Mutex::new(ConnectRecv {
                 stream: recv,
                 capsules: CapsuleReader::default(),
+                close_received: false,
+                end_error: None,
                 ended: false,
             }),
             state: Arc::default(),
@@ -385,64 +391,97 @@ where
     /// This returns once both sides of the CONNECT stream are closed. After [`Self::close`], that
     /// means waiting for the client to close its side, which it does on receiving the close. Until
     /// then, closing the QUIC connection could lose the close, so wait for this first. If the
-    /// client might not respond, wait with a timeout.
+    /// client might not respond, wait with a timeout. This also applies after a client close
+    /// capsule: the session terminates immediately, but this waits for FIN to reject trailing data.
     ///
     /// Closes from the client are only noticed while this or [`Self::draining`] is being polled.
     pub async fn closed(&self) -> Result<CloseInfo, SessionError> {
         let mut registration = None;
         poll_fn(|cx| self.poll_connect_stream(cx, SessionState::is_terminated, &mut registration))
             .await;
-        let outcome = self
-            .state
-            .outcome()
-            .expect("session has terminated")
-            .clone();
-
         // After a close from the server, wait for the client to close its side of the CONNECT
-        // stream. After a close from the client, we have stopped reading it.
+        // stream. After a close from the client, reject any further data before its FIN.
         //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
         //# To avoid this, the endpoint SHOULD wait until all CONNECT streams have
         //# been closed by the peer before sending the CONNECTION_CLOSE
-        poll_fn(|cx| self.poll_connect_stream_end(cx, &mut registration)).await;
+        let outcome = poll_fn(|cx| self.poll_connect_stream_end(cx, &mut registration))
+            .await
+            .and_then(|()| {
+                self.state
+                    .outcome()
+                    .expect("session has terminated")
+                    .clone()
+            });
 
         // Then close our side in response, unless we closed the session.
         let mut send = self.connect_send.lock().await;
-        if !send.closed {
+        if matches!(outcome, Err(SessionError::MalformedCapsule(_))) {
+            // Reset even if we already sent FIN after a local close.
             send.closed = true;
-            match outcome {
-                Err(SessionError::MalformedCapsule(_)) => {
-                    send.stream.stop_stream(Code::H3_MESSAGE_ERROR);
-                }
-                _ => {
-                    //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
-                    //# The recipient MUST either
-                    //# close or reset the stream in response.
-                    let _ = send.stream.finish().await;
-                }
-            }
+            send.stream.stop_stream(Code::H3_MESSAGE_ERROR);
+        } else if !send.closed {
+            send.closed = true;
+            //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
+            //# The recipient MUST either
+            //# close or reset the stream in response.
+            let _ = send.stream.finish().await;
         }
 
         outcome
     }
 
-    /// Discards data on the CONNECT stream until the client finishes or resets it.
+    /// Waits for the client to finish or reset CONNECT, rejecting data after its close capsule.
     fn poll_connect_stream_end(
         &self,
         cx: &mut Context<'_>,
         registration: &mut Registration,
-    ) -> Poll<()> {
+    ) -> Poll<Result<(), SessionError>> {
         self.state.register_connect(cx.waker(), registration);
         let waker = self.state.connect_waker();
         let mut stream_cx = Context::from_waker(&waker);
 
         let mut recv = self.connect_recv.lock().unwrap();
         while !recv.ended {
-            match ready!(recv.stream.poll_recv_data(&mut stream_cx)) {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => recv.ended = true,
+            let error = match ready!(recv.stream.poll_recv_data(&mut stream_cx)) {
+                Ok(Some(data)) if recv.close_received && data.has_remaining() => {
+                    //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
+                    //# If any additional data is received on the CONNECT stream after receiving
+                    //# a WT_CLOSE_SESSION capsule, the stream MUST be reset with H3_MESSAGE_ERROR.
+                    Some(SessionError::MalformedCapsule(
+                        "CONNECT stream data after WT_CLOSE_SESSION",
+                    ))
+                }
+                Ok(Some(data)) => {
+                    // A local close may have terminated the session before the peer's close
+                    // arrived. Parse its capsules too, rather than discarding unchecked bytes.
+                    recv.capsules.push(data);
+                    match self.read_capsules(&mut recv.capsules) {
+                        Some(Ok(_)) => {
+                            recv.close_received = true;
+                            None
+                        }
+                        Some(Err(err)) => Some(err),
+                        None => None,
+                    }
+                }
+                Ok(None) => {
+                    recv.ended = true;
+                    (!recv.capsules.is_empty()).then_some(SessionError::MalformedCapsule(
+                        "CONNECT stream ended within a capsule",
+                    ))
+                }
+                Err(_) => {
+                    recv.ended = true;
+                    None
+                }
+            };
+            if let Some(error) = error {
+                recv.end_error = Some(error);
+                recv.stream.stop_sending(Code::H3_MESSAGE_ERROR);
+                recv.ended = true;
             }
         }
-        Poll::Ready(())
+        Poll::Ready(recv.end_error.clone().map_or(Ok(()), Err))
     }
 
     /// Waits until the client asks to close the session gracefully, or the session terminates.
@@ -515,11 +554,7 @@ where
 
             match &outcome {
                 Ok(_) if !recv.ended => {
-                    //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16#section-6
-                    //# After receiving the WT_CLOSE_SESSION capsule, the receiver MAY send a
-                    //# STOP_SENDING with error code WT_SESSION_GONE.
-                    recv.stream.stop_sending(Code::from(crate::WT_SESSION_GONE));
-                    recv.ended = true;
+                    recv.close_received = true;
                 }
                 Err(SessionError::MalformedCapsule(_)) if !recv.ended => {
                     recv.stream.stop_sending(Code::H3_MESSAGE_ERROR);
@@ -539,7 +574,12 @@ where
         loop {
             match capsules.next() {
                 Ok(Some(Capsule::CloseSession { code, reason })) => {
-                    return Some(Ok(CloseInfo { code, reason }))
+                    if !capsules.is_empty() {
+                        return Some(Err(SessionError::MalformedCapsule(
+                            "CONNECT stream data after WT_CLOSE_SESSION",
+                        )));
+                    }
+                    return Some(Ok(CloseInfo { code, reason }));
                 }
                 Ok(Some(Capsule::DrainSession)) => self.state.drain(),
                 Ok(None) => return None,

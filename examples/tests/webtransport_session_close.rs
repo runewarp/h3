@@ -63,6 +63,7 @@ async fn capsules_in_one_data_frame() {
         let mut data = drain_capsule().to_vec();
         data.extend_from_slice(&close_capsule(1, b"both"));
         setup.stream.send_data(Bytes::from(data)).await.unwrap();
+        setup.stream.finish().await.unwrap();
 
         timeout(TIMEOUT, setup.session.draining()).await.unwrap();
         let outcome = timeout(TIMEOUT, setup.session.closed()).await.unwrap();
@@ -159,6 +160,7 @@ async fn closed_and_draining_wait_together() {
             .send_data(close_capsule(3, b"later"))
             .await
             .unwrap();
+        setup.stream.finish().await.unwrap();
         let outcome = timeout(TIMEOUT, closed).await.unwrap().unwrap();
         assert_eq!(outcome.unwrap(), info(3, "later"));
     })
@@ -430,4 +432,73 @@ async fn unknown_capsules_do_not_wake_idle_streams() {
     })
     .await
     .expect("WebTransport capsule wakeup test timed out");
+}
+
+#[tokio::test]
+async fn data_after_close_in_the_same_frame_resets_connect() {
+    timeout(TIMEOUT, async {
+        let mut setup = setup().await;
+        let mut data = close_capsule(9, b"bye").to_vec();
+        data.extend_from_slice(b"trailing");
+        setup.stream.send_data(Bytes::from(data)).await.unwrap();
+
+        assert!(matches!(setup.session.closed().await, Err(SessionError::MalformedCapsule(_))));
+        assert!(matches!(setup.stream.recv_data().await, Err(StreamError::RemoteTerminate { code }) if code == Code::H3_MESSAGE_ERROR));
+    }).await.expect("WebTransport trailing-data test timed out");
+}
+
+#[tokio::test]
+async fn data_in_a_later_frame_after_close_resets_connect() {
+    timeout(TIMEOUT, async {
+        let mut setup = setup().await;
+        setup.stream.send_data(close_capsule(9, b"bye")).await.unwrap();
+        let mut closed = Box::pin(setup.session.closed());
+        assert!(timeout(Duration::from_millis(50), &mut closed).await.is_err(), "closed() must validate through the peer FIN");
+        assert!(setup.session.open_bi(setup.session.session_id()).await.is_err(), "the close capsule must terminate the session before FIN");
+
+        setup.stream.send_data(Bytes::from_static(b"trailing")).await.unwrap();
+        assert!(matches!(closed.await, Err(SessionError::MalformedCapsule(_))));
+        assert!(matches!(setup.stream.recv_data().await, Err(StreamError::RemoteTerminate { code }) if code == Code::H3_MESSAGE_ERROR));
+        // Repeated callers see the same malformed close, even after the reader ended.
+        assert!(matches!(setup.session.closed().await, Err(SessionError::MalformedCapsule(_))));
+    }).await.expect("WebTransport later trailing-data test timed out");
+}
+
+#[tokio::test]
+async fn client_close_waits_for_fin_and_can_be_cancelled() {
+    timeout(TIMEOUT, async {
+        let mut setup = setup().await;
+        setup
+            .stream
+            .send_data(close_capsule(9, b"bye"))
+            .await
+            .unwrap();
+        assert!(timeout(Duration::from_millis(50), setup.session.closed())
+            .await
+            .is_err());
+        // Cancelling the timeout releases this caller; another caller can finish validation.
+        setup.stream.finish().await.unwrap();
+        assert_eq!(setup.session.closed().await.unwrap(), info(9, "bye"));
+        assert_eq!(read_to_end(&mut setup.stream).await, Bytes::new());
+    })
+    .await
+    .expect("WebTransport client FIN test timed out");
+}
+
+#[tokio::test]
+async fn trailing_data_is_rejected_after_a_local_close() {
+    timeout(TIMEOUT, async {
+        let mut setup = setup().await;
+        setup.session.close(0, "local").await.unwrap();
+        let mut data = close_capsule(9, b"bye").to_vec();
+        data.extend_from_slice(b"trailing");
+        setup.stream.send_data(Bytes::from(data)).await.unwrap();
+        setup.stream.finish().await.unwrap();
+        assert!(matches!(
+            setup.session.closed().await,
+            Err(SessionError::MalformedCapsule(_))
+        ));
+    })
+    .await
+    .expect("WebTransport local close validation timed out");
 }
