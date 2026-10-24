@@ -11,6 +11,10 @@ This crate provides an [HTTP/3][spec] implementation that is generic over a prov
 [spec]: https://www.rfc-editor.org/rfc/rfc9114
 [design]: docs/PROPOSAL.md
 
+## Runewarp fork
+
+The `runewarp/webtransport` branch adds bounded client and detached Server WebTransport sessions while ordinary HTTP/3 requests continue. See [the API guide](h3-webtransport/readme.md) and [the full patch inventory](PATCHES.md) for source attribution, the Draft07 carrier subset, backend compatibility requirements and deferred parser security fixes. Consumer projects should pin an exact reviewed commit. `master` remains an unchanged upstream mirror.
+
 ## Status
 
 The `h3` crate is still very experimental. While the client and servers do work, there may still be bugs. And the API could change as we continue to explore. That said, we eagerly welcome contributions, trying it out in test environments, and using at your own risk.

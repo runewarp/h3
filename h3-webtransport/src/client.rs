@@ -1,9 +1,9 @@
 //! Client sessions alongside ordinary HTTP/3 requests.
 //!
 //! Build an h3 client with WebTransport, datagrams, extended CONNECT and a session limit enabled,
-//! then pass both returned handles to [`new`]. Poll [`Connection::wait_idle`] in a separate task.
-//! [`Client::send_request`] returns ordinary request handles for GET, PUT and other HTTP methods.
-//! No tasks are spawned by this module. Poll session [`WebTransportSession::closed`] concurrently
+//! then pass both returned handles to [`new`](crate::client::new). Poll [`Connection::wait_idle`](crate::client::Connection::wait_idle) in a separate task.
+//! [`Client::send_request`](crate::client::Client::send_request) returns ordinary request handles for GET, PUT and other HTTP methods.
+//! No tasks are spawned by this module. Poll session [`WebTransportSession::closed`](crate::client::WebTransportSession::closed) concurrently
 //! with application work to receive close/drain capsules and acknowledge peer closes.
 //!
 //! The supported subset uses the adopted draft 02/07/13/15 negotiation and stream formats. It
