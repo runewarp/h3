@@ -413,9 +413,6 @@ where
                 Poll::Ready(Err(stream::PollTypeError::IncomingError(e))) => {
                     return Err(self.handle_connection_error(e));
                 }
-                Poll::Ready(Err(stream::PollTypeError::InternalError(e))) => {
-                    return Err(self.handle_connection_error(e));
-                }
                 Poll::Ready(Err(stream::PollTypeError::EndOfStream)) =>
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
                 //# A receiver MUST tolerate unidirectional streams being

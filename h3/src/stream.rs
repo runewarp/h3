@@ -11,7 +11,6 @@ use tokio::io::ReadBuf;
 
 use crate::{
     buf::BufList,
-    error::{internal_error::InternalConnectionError, Code},
     frame::FrameStream,
     proto::{
         coding::Encode,
@@ -284,7 +283,6 @@ pub(super) struct AcceptRecvStream<S, B> {
     ty: Option<StreamType>,
     /// push_id or session_id
     id: Option<VarInt>,
-    expected: Option<usize>,
 }
 
 impl<S, B> AcceptRecvStream<S, B>
@@ -297,7 +295,6 @@ where
             stream: BufRecvStream::new(stream),
             ty: None,
             id: None,
-            expected: None,
         }
     }
 
@@ -315,70 +312,36 @@ where
         }
     }
 
-    // helper function to poll the next VarInt from self.stream
-    fn poll_next_varint(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(VarInt, Option<StreamEnd>), PollTypeError>> {
-        // Flag if the stream was reset or finished by the peer
-        let mut stream_stopped = None;
-
-        loop {
-            if stream_stopped.is_some() {
-                return Poll::Ready(Err(PollTypeError::EndOfStream));
+    // Check buffered bytes before reading, and decode each varint with its own width.
+    fn poll_next_varint(&mut self, cx: &mut Context<'_>) -> Poll<Result<VarInt, PollTypeError>> {
+        for _ in 0..32 {
+            let mut cursor = self.stream.buf().cursor();
+            let before = cursor.remaining();
+            if let Ok(value) = VarInt::decode(&mut cursor) {
+                let consumed = before - cursor.remaining();
+                self.stream.buf_mut().advance(consumed);
+                return Poll::Ready(Ok(value));
             }
             //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
             //# A receiver MUST tolerate unidirectional streams being
             //# closed or reset prior to the reception of the unidirectional stream
             //# header.
-            stream_stopped = match ready!(self.stream.poll_read(cx)) {
-                Ok(false) => None,
-                Ok(true) => Some(StreamEnd::EndOfStream),
+            match ready!(self.stream.poll_read(cx)) {
+                Ok(false) => {}
                 Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
                     return Poll::Ready(Err(PollTypeError::IncomingError(connection_error)));
                 }
-                Err(StreamErrorIncoming::StreamTerminated { error_code }) => {
-                    Some(StreamEnd::Reset(error_code))
-                }
-                Err(StreamErrorIncoming::Unknown(_err)) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!("Unknown error when reading stream {}", _err);
-
-                    Some(StreamEnd::Other)
-                }
-            };
-
-            let mut buf = self.stream.buf_mut();
-            if self.expected.is_none() && buf.remaining() >= 1 {
-                self.expected = Some(VarInt::encoded_size(buf.chunk()[0]));
+                _ => return Poll::Ready(Err(PollTypeError::EndOfStream)),
             }
-
-            if let Some(expected) = self.expected {
-                if buf.remaining() < expected {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-
-            let reult = VarInt::decode(&mut buf).map_err(|_| {
-                PollTypeError::InternalError(InternalConnectionError::new(
-                    Code::H3_INTERNAL_ERROR,
-                    "Unexpected end parsing varint".to_string(),
-                ))
-            })?;
-
-            return Poll::Ready(Ok((reult, stream_stopped)));
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     pub fn poll_type(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), PollTypeError>> {
         // If we haven't parsed the stream type yet
         if self.ty.is_none() {
-            // TODO create a test for the StreamEnd Option
-            // If the stream ended or reset directly after the type was received
-            // can we poll data again?
-            let (var, _) = ready!(self.poll_next_varint(cx))?;
+            let var = ready!(self.poll_next_varint(cx))?;
             let ty = StreamType::from_value(var.0);
             self.ty = Some(ty);
         }
@@ -389,7 +352,7 @@ where
             Some(StreamType::PUSH | StreamType::WEBTRANSPORT_UNI)
         ) && self.id.is_none()
         {
-            let (var, _) = ready!(self.poll_next_varint(cx))?;
+            let var = ready!(self.poll_next_varint(cx))?;
             self.id = Some(var);
         }
 
@@ -397,17 +360,8 @@ where
     }
 }
 
-enum StreamEnd {
-    EndOfStream,
-    #[allow(dead_code)]
-    Reset(u64),
-    // if the quic layer returns an unknown error
-    Other,
-}
-
 pub(super) enum PollTypeError {
     IncomingError(ConnectionErrorIncoming),
-    InternalError(InternalConnectionError),
     // Stream stopped with eos or reset.
     // No Code is received
     EndOfStream,
@@ -485,6 +439,12 @@ impl<B, S: RecvStream> BufRecvStream<S, B> {
     #[inline]
     pub(crate) fn buf_mut(&mut self) -> &mut BufList<Bytes> {
         &mut self.buf
+    }
+
+    /// Inspect buffered bytes without consuming them. Extension classifiers can examine a
+    /// bounded prefix before handing an ordinary request back to its frame decoder.
+    pub fn buffered(&self) -> impl Buf + '_ {
+        self.buf.cursor()
     }
 
     /// Returns the next chunk of data from the stream

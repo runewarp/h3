@@ -113,6 +113,17 @@ where
         self.poll_accept_request_stream_internal(cx)
     }
 
+    /// Local SETTINGS normalized through their actual wire encoding. None when suppressed.
+    pub fn advertised_settings(&self) -> Option<crate::Settings> {
+        #[cfg(test)]
+        if !self.inner.config.send_settings {
+            return None;
+        }
+        crate::proto::frame::Settings::try_from(self.inner.config)
+            .ok()
+            .map(|wire| crate::Settings::from(&wire))
+    }
+
     /// Polls the Connection until the peer's SETTINGS frame has been received.
     ///
     /// Extensions negotiated through SETTINGS, such as WebTransport, need to wait for it before
