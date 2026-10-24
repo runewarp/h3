@@ -38,7 +38,7 @@ pub async fn setup() -> Setup {
     setup_with(
         &WebTransportDraft::ALL,
         &WebTransportDraft::ALL,
-        Protocol::WEB_TRANSPORT,
+        Protocol::WEB_TRANSPORT_H3,
     )
     .await
 }
@@ -125,6 +125,8 @@ pub async fn setup_with(
     let (mut driver, mut send_request) = h3::client::builder()
         .enable_webtransport(true)
         .enable_datagram(true)
+        .enable_extended_connect(true)
+        .max_webtransport_sessions(1)
         .webtransport_drafts(client_drafts.iter().copied())
         .build::<_, _, Bytes>(h3_quinn::Connection::new(conn.clone()))
         .await
@@ -152,6 +154,11 @@ pub async fn setup_with(
         .body(())
         .unwrap();
     request.extensions_mut().insert(protocol);
+    if client_drafts.contains(&WebTransportDraft::Draft02) {
+        request
+            .headers_mut()
+            .insert("sec-webtransport-http3-draft02", "1".parse().unwrap());
+    }
     let mut stream = send_request.send_request(request).await.unwrap();
     let response = stream.recv_response().await.unwrap();
     let session = server.await.unwrap();

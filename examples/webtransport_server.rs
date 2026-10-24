@@ -1,19 +1,27 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use h3::{
-    ext::{Protocol, WebTransportDraft},
-    quic::{self},
+    error::Code,
+    ext::WebTransportDraft,
+    quic::{RecvStream as _, SendStream as _},
     server::Connection,
 };
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
-use h3_webtransport::server::{self, WebTransportSession};
+use h3_webtransport::server;
 use http::Method;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::pin;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Semaphore,
+    task::JoinSet,
+};
+
 use tracing::{error, info, trace_span};
+
+// Generic example budget, including long-lived CONNECT handlers.
+const MAX_REQUEST_HANDLERS: usize = 32;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
@@ -133,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(conn) => {
                     info!("new http3 established");
                     let h3_conn = h3::server::builder()
+                        .max_field_section_size(16 * 1024)
                         .enable_webtransport(true)
                         .enable_extended_connect(true)
                         .enable_datagram(true)
@@ -143,21 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                         .unwrap();
 
-                    // tracing::info!("Establishing WebTransport session");
-                    // // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
-                    // // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
-                    // // to the webtransport session.
-
                     if let Err(err) = handle_connection(h3_conn).await {
-                        tracing::error!("Failed to handle connection: {err:?}");
+                        error!("Failed to handle connection: {err:?}");
                     }
-
-                    // let mut session: WebTransportSession<_, Bytes> =
-                    //     WebTransportSession::accept(h3_conn).await.unwrap();
-                    // tracing::info!("Finished establishing webtransport session");
-                    // // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
-                    // // h3_conn needs to hand over the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
-                    // let result = handle.await;
                 }
                 Err(err) => {
                     error!("accepting connection failed: {:?}", err);
@@ -173,174 +170,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) -> Result<()> {
-    // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
-    // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
-    // to the webtransport session.
-
+// The connection task keeps accepting requests while session tasks open or await streams.
+async fn handle_connection(conn: Connection<h3_quinn::Connection, Bytes>) -> Result<()> {
+    let (mut driver, acceptor) = server::new(conn, server::Limits::default());
+    let budget = Arc::new(Semaphore::new(MAX_REQUEST_HANDLERS));
+    // Dropping the set aborts all request/session handlers on driver loss or error.
+    let mut handlers = JoinSet::new();
     loop {
-        match conn.accept().await {
-            Ok(Some(resolver)) => {
-                // TODO: resolve request in a different task to not block the accept loop
-                let (req, stream) = match resolver.resolve_request().await {
-                    Ok(request) => request,
-                    Err(err) => {
-                        error!("error resolving request: {err:?}");
-                        continue;
-                    }
-                };
-                info!("new request: {:#?}", req);
-
-                let ext = req.extensions();
-                match req.method() {
-                    &Method::CONNECT
-                        if ext.get::<Protocol>().is_some_and(Protocol::is_webtransport) =>
-                    {
-                        tracing::info!("Peer wants to initiate a webtransport session");
-
-                        tracing::info!("Handing over connection to WebTransport");
-                        let session = WebTransportSession::accept(req, stream, conn).await?;
-                        tracing::info!(
-                            "Established webtransport session using {:?}",
-                            session.draft()
-                        );
-                        // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
-                        // h3_conn needs to hand over the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
-                        handle_session_and_echo_all_inbound_messages(session).await?;
-
-                        return Ok(());
-                    }
-                    _ => {
-                        tracing::info!(?req, "Received request");
-                    }
+        let mut resolver = tokio::select! {
+            request = driver.accept() => match request? {
+                Some(resolver) => resolver,
+                None => break,
+            },
+            Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                if let Err(error) = result {
+                    error!("Request handler task failed: {error:?}");
                 }
+                continue;
             }
-            // indicating no more streams to be received
-            Ok(None) => {
-                break;
+        };
+        // Never spawn a task to wait for capacity or block the connection driver on a permit.
+        let Ok(permit) = budget.clone().try_acquire_owned() else {
+            resolver
+                .frame_stream
+                .stream
+                .reset(Code::H3_REQUEST_REJECTED.value());
+            resolver
+                .frame_stream
+                .stream
+                .stop_sending(Code::H3_REQUEST_REJECTED.value());
+            continue;
+        };
+        let acceptor = acceptor.clone();
+        handlers.spawn(async move {
+            let _permit = permit;
+            let result: Result<()> = async {
+                let (request, mut stream) =
+                    tokio::time::timeout(Duration::from_secs(10), resolver.resolve_request())
+                        .await??;
+                if request.method() == Method::CONNECT {
+                    let session = acceptor.accept(request, stream).await?;
+                    info!(draft = ?session.draft(), "Established WebTransport session");
+                    handle_session(session).await?;
+                } else {
+                    // Ordinary GET/PUT intake remains independent of session stream credit.
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        while stream.recv_data().await?.is_some() {}
+                        stream.send_response(http::Response::new(())).await?;
+                        stream.finish().await
+                    })
+                    .await??;
+                }
+                Ok(())
             }
-            Err(err) => {
-                error!("Connection errored with {}", err);
-                break;
+            .await;
+            if let Err(error) = result {
+                error!("Request/session failed: {error:?}");
             }
-        }
+        });
     }
+    handlers.shutdown().await;
     Ok(())
 }
 
-macro_rules! log_result {
-    ($expr:expr) => {
-        if let Err(err) = $expr {
-            tracing::error!("{err:?}");
+async fn echo_stream(mut stream: impl AsyncRead + AsyncWrite + Unpin) -> Result<()> {
+    let mut buffer = [0; 4096];
+    loop {
+        let len = stream.read(&mut buffer).await?;
+        if len == 0 {
+            return Ok(stream.shutdown().await?);
         }
+        stream.write_all(&buffer[..len]).await?;
+    }
+}
+
+// This example exercises the detached bidi subset. Uni dispatch and datagram routing are
+// deliberately unsupported by the detached drivers. Applications own authentication and budgets.
+async fn handle_session(session: server::Session<h3_quinn::Connection, Bytes>) -> Result<()> {
+    let work = async {
+        let greeting = async {
+            let mut stream = session.opener().open_bi().await?;
+            stream
+                .write_all(b"Hello from a server initiated bidi stream")
+                .await
+                .context("Failed to send greeting")?;
+            stream.shutdown().await?;
+            tokio::spawn(async move {
+                if let Err(error) = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await {
+                    error!("Server stream failed: {error:?}");
+                }
+            });
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = greeting {
+            error!("Greeting failed: {error:?}");
+        }
+        while let Some(stream) = session.accept_bi().await {
+            tokio::spawn(async move {
+                if let Err(error) = echo_stream(stream).await {
+                    error!("Echo failed: {error:?}");
+                }
+            });
+        }
+        // Termination wakes accept_bi before peer FIN. Let closed() validate that FIN.
+        futures::future::pending::<()>().await
     };
-}
-
-async fn echo_stream<T, R>(send: T, recv: R) -> anyhow::Result<()>
-where
-    T: AsyncWrite,
-    R: AsyncRead,
-{
-    pin!(send);
-    pin!(recv);
-
-    tracing::info!("Got stream");
-    let mut buf = Vec::new();
-    recv.read_to_end(&mut buf).await?;
-
-    let message = Bytes::from(buf);
-
-    send_chunked(send, message).await?;
-
-    Ok(())
-}
-
-// Used to test that all chunks arrive properly as it is easy to write an impl which only reads and
-// writes the first chunk.
-async fn send_chunked(mut send: impl AsyncWrite + Unpin, data: Bytes) -> anyhow::Result<()> {
-    for chunk in data.chunks(4) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        tracing::info!("Sending {chunk:?}");
-        send.write_all(chunk).await?;
-    }
-
-    Ok(())
-}
-
-async fn open_bidi_test<S>(mut stream: S) -> anyhow::Result<()>
-where
-    S: Unpin + AsyncRead + AsyncWrite,
-{
-    tracing::info!("Opening bidirectional stream");
-
-    stream
-        .write_all(b"Hello from a server initiated bidi stream")
-        .await
-        .context("Failed to respond")?;
-
-    let mut resp = Vec::new();
-    stream.shutdown().await?;
-    stream.read_to_end(&mut resp).await?;
-
-    tracing::info!("Got response from client: {resp:?}");
-
-    Ok(())
-}
-
-/// This method will echo all inbound datagrams, unidirectional and bidirectional streams.
-async fn handle_session_and_echo_all_inbound_messages(
-    session: WebTransportSession<h3_quinn::Connection, Bytes>,
-) -> anyhow::Result<()> {
-    let session_id = session.session_id();
-
-    // This will open a bidirectional stream and send a message to the client right after connecting!
-    let stream = session.open_bi(session_id).await?;
-
-    tokio::spawn(async move { log_result!(open_bidi_test(stream).await) });
-
-    let mut datagram_reader = session.datagram_reader();
-    let mut datagram_sender = session.datagram_sender();
-
-    loop {
-        tokio::select! {
-            datagram = datagram_reader.read_datagram() => {
-                let datagram = match datagram {
-                    Ok(datagram) => datagram,
-                    Err(err) => {
-                        tracing::error!("Failed to read datagram: {err:?}");
-                        break;
-                    }
-                };
-                tracing::info!("Received datagram: {datagram:?}");
-                let datagram = datagram.into_payload();
-                datagram_sender.send_datagram(datagram)?;
-            }
-            uni_stream = session.accept_uni() => {
-                let (id, stream) = uni_stream?.unwrap();
-
-                let send = session.open_uni(id).await?;
-                tokio::spawn( async move { log_result!(echo_stream(send, stream).await); });
-            }
-            stream = session.accept_bi() => {
-                if let Some(resolver) = stream? {
-                    tokio::spawn(async move {
-                        log_result!(async move {
-                            if let server::AcceptedBi::BidiStream(_, stream) = resolver.resolve().await? {
-                                let (send, recv) = quic::BidiStream::split(stream);
-                                echo_stream(send, recv).await?;
-                            }
-                            Ok::<_, anyhow::Error>(())
-                        }.await);
-                    });
-                }
-            }
-            else => {
-                break
-            }
+    tokio::select! {
+        // Demonstration policy: cap session lifetime at five minutes, including peer FIN wait.
+        outcome = tokio::time::timeout(Duration::from_secs(300), session.closed()) => {
+            info!(outcome = ?outcome?, "Session ended");
         }
+        () = work => {},
     }
-
-    tracing::info!("Finished handling session");
-
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/webtransport_server/budget.rs"]
+mod budget_tests;

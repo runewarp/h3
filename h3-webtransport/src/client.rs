@@ -1,9 +1,9 @@
 //! Client sessions alongside ordinary HTTP/3 requests.
 //!
 //! Build an h3 client with WebTransport, datagrams, extended CONNECT and a session limit enabled,
-//! then pass both returned handles to [`new`]. Poll [`Connection::wait_idle`] in a separate task.
-//! [`Client::send_request`] returns ordinary request handles for GET, PUT and other HTTP methods.
-//! No tasks are spawned by this module. Poll session [`WebTransportSession::closed`] concurrently
+//! then pass both returned handles to [`new`](crate::client::new). Poll [`Connection::wait_idle`](crate::client::Connection::wait_idle) in a separate task.
+//! [`Client::send_request`](crate::client::Client::send_request) returns ordinary request handles for GET, PUT and other HTTP methods.
+//! No tasks are spawned by this module. Poll session [`WebTransportSession::closed`](crate::client::WebTransportSession::closed) concurrently
 //! with application work to receive close/drain capsules and acknowledge peer closes.
 //!
 //! The supported subset uses the adopted draft 02/07/13/15 negotiation and stream formats. It
@@ -113,12 +113,12 @@ impl From<StreamError> for ConnectError {
 }
 
 #[derive(Clone, Copy)]
-struct Negotiated {
-    draft: WebTransportDraft,
-    cap: u64,
+pub(crate) struct Negotiated {
+    pub(crate) draft: WebTransportDraft,
+    pub(crate) cap: u64,
 }
 
-fn negotiate(local: &Settings, peer: &Settings) -> Result<Negotiated, &'static str> {
+pub(crate) fn negotiate(local: &Settings, peer: &Settings) -> Result<Negotiated, &'static str> {
     if !(local.enable_webtransport()
         && peer.enable_webtransport()
         && local.enable_datagram()
@@ -155,20 +155,20 @@ struct RegistryInner<S: quic::BidiStream<B>, B: Buf> {
     open: bool,
 }
 
-struct Incoming<S: quic::BidiStream<B>, B: Buf> {
-    state: Arc<SessionState>,
-    streams: Mutex<VecDeque<BufRecvStream<S, B>>>,
-    wakers: Arc<WakerSet>,
-    cap: usize,
+pub(crate) struct Incoming<S: quic::BidiStream<B>, B: Buf> {
+    pub(crate) state: Arc<SessionState>,
+    pub(crate) streams: Mutex<VecDeque<BufRecvStream<S, B>>>,
+    pub(crate) wakers: Arc<WakerSet>,
+    pub(crate) cap: usize,
 }
 
-fn abort<S: quic::SendStream<B> + quic::RecvStream, B: Buf>(stream: &mut S, code: u64) {
+pub(crate) fn abort<S: quic::SendStream<B> + quic::RecvStream, B: Buf>(stream: &mut S, code: u64) {
     stream.reset(code);
     stream.stop_sending(code);
 }
 
 impl<S: quic::BidiStream<B>, B: Buf> Incoming<S, B> {
-    fn discard(&self) {
+    pub(crate) fn discard(&self) {
         let streams = std::mem::take(&mut *self.streams.lock().unwrap());
         for mut stream in streams {
             abort(&mut stream, WT_SESSION_GONE);
@@ -176,7 +176,7 @@ impl<S: quic::BidiStream<B>, B: Buf> Incoming<S, B> {
         self.wakers.wake_all();
     }
 
-    fn deliver(&self, mut stream: BufRecvStream<S, B>) {
+    pub(crate) fn deliver(&self, mut stream: BufRecvStream<S, B>) {
         let mut streams = self.streams.lock().unwrap();
         if self.state.is_terminated() {
             abort(&mut stream, WT_SESSION_GONE);
@@ -293,6 +293,17 @@ where
     /// Poll the connection. Prefix parsing never awaits another stream or application queue.
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
         let result = self.connection.poll_close(cx);
+        // This API dispatches bidi streams only. Reject unsupported uni streams instead of
+        // retaining the underlying H3 queue indefinitely.
+        for (_, mut stream) in self
+            .connection
+            .inner
+            .accepted_streams_mut()
+            .wt_uni_streams
+            .drain(..)
+        {
+            quic::RecvStream::stop_sending(&mut stream, WT_SESSION_GONE);
+        }
         if let Poll::Ready(error) = result {
             self.stop(Some(error.clone()));
             return Poll::Ready(error);
@@ -533,7 +544,7 @@ impl<S: quic::BidiStream<B>, B: Buf> Drop for PendingConnect<S, B> {
 }
 
 // Only two QUIC varints are parsed, never an H3 frame length or application payload.
-struct Prefix<S: quic::BidiStream<B>, B: Buf> {
+pub(crate) struct Prefix<S: quic::BidiStream<B>, B: Buf> {
     stream: Option<BufRecvStream<S, B>>,
     bytes: [u8; 8],
     len: usize,
@@ -541,8 +552,11 @@ struct Prefix<S: quic::BidiStream<B>, B: Buf> {
 }
 impl<S: quic::BidiStream<B>, B: Buf> Prefix<S, B> {
     fn new(stream: S) -> Self {
+        Self::buffered(BufRecvStream::new(stream))
+    }
+    pub(crate) fn buffered(stream: BufRecvStream<S, B>) -> Self {
         Self {
-            stream: Some(BufRecvStream::new(stream)),
+            stream: Some(stream),
             bytes: [0; 8],
             len: 0,
             signal: false,
