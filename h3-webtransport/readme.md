@@ -58,8 +58,7 @@ Pinning draft 07 on both peers preserves the prototype's max-sessions codepoint 
 
 The constructor replaces any prior server-stream dispatch registration and must run before the h3 driver is polled. It uses the existing third-party-backend extension APIs. A custom backend must preserve bounded transport receive windows and the normal h3 SETTINGS advertisement; manual suppression or mutation after attaching the extension is unsupported. CONNECT cancellation while awaiting its response resets both directions and releases the reservation. Cancellation inside h3's initial request-header send retains that API's existing behavior.
 
-The Server session still owns its connection in this layer. A subsequent layer must detach its opener from ordinary request intake, enforce Server CONNECT and session admission, validate inbound full session IDs, and address concurrent credit-blocked Quinn opener wakers. This client layer adds no application authentication, Tunnel, Visitor, capacity, or withdrawal policy.
-
+The detached Server API below separates session admission and stream opening from ordinary request intake. These crates add no application authentication, Tunnel, Visitor, handler capacity or withdrawal policy.
 
 ## Detached Server sessions
 
