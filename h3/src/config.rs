@@ -47,6 +47,8 @@ pub struct Settings {
     /// The WebTransport drafts advertised when `enable_webtransport` is set, or the drafts the peer
     /// advertised.
     pub(crate) webtransport_drafts: WebTransportDrafts,
+    // Preserve each received dialect's limit, rather than borrowing another dialect's cap.
+    pub(crate) webtransport_session_limits: Option<[u64; 3]>,
 }
 
 /// A set of [`WebTransportDraft`]s
@@ -125,6 +127,15 @@ impl From<&frame::Settings> for Settings {
                 .unwrap_or(defaults.max_field_section_size),
             enable_webtransport: !webtransport_drafts.is_empty(),
             webtransport_drafts,
+            webtransport_session_limits: Some([
+                settings
+                    .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS)
+                    .unwrap_or(0),
+                settings
+                    .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07)
+                    .unwrap_or(0),
+                settings.get(frame::SettingId::WT_MAX_SESSIONS).unwrap_or(0),
+            ]),
             max_webtransport_sessions: settings
                 .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS)
                 .or_else(|| settings.get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07))
@@ -159,6 +170,7 @@ impl TryFrom<Config> for frame::Settings {
                     enable_datagram,
                     max_webtransport_sessions,
                     webtransport_drafts,
+                    webtransport_session_limits: _,
                 },
         } = value;
 
@@ -239,6 +251,7 @@ impl Default for Settings {
             enable_datagram: false,
             max_webtransport_sessions: 0,
             webtransport_drafts: WebTransportDrafts::ALL,
+            webtransport_session_limits: None,
         }
     }
 }
@@ -248,6 +261,23 @@ impl Settings {
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub fn enable_webtransport(&self) -> bool {
         self.enable_webtransport
+    }
+
+    /// Concurrent session limit for the selected draft, or `None` for draft 15's enable flag.
+    ///
+    /// A zero limit forbids creating sessions. Limits from different drafts are independent.
+    pub fn webtransport_session_limit(&self, draft: WebTransportDraft) -> Option<u64> {
+        let limits = self.webtransport_session_limits.unwrap_or([
+            self.max_webtransport_sessions,
+            self.max_webtransport_sessions.max(1),
+            1,
+        ]);
+        match draft {
+            WebTransportDraft::Draft02 => Some(limits[0]),
+            WebTransportDraft::Draft07 => Some(limits[1]),
+            WebTransportDraft::Draft13 => Some(limits[2]),
+            WebTransportDraft::Draft15 => None,
+        }
     }
 
     /// The WebTransport drafts that are supported, oldest first
@@ -307,6 +337,38 @@ mod tests {
             webtransport_drafts: drafts.iter().copied().collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn session_caps_belong_to_the_negotiated_draft() {
+        let settings = peer(&[
+            (frame::SettingId::ENABLE_WEBTRANSPORT, 1),
+            (frame::SettingId::WEBTRANSPORT_MAX_SESSIONS, 7),
+            (frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 3),
+            (frame::SettingId::WT_MAX_SESSIONS, 1),
+            (frame::SettingId::WT_ENABLED, 1),
+        ]);
+        assert_eq!(
+            settings.webtransport_session_limit(WebTransportDraft::Draft02),
+            Some(7)
+        );
+        assert_eq!(
+            settings.webtransport_session_limit(WebTransportDraft::Draft07),
+            Some(3)
+        );
+        assert_eq!(
+            settings.webtransport_session_limit(WebTransportDraft::Draft13),
+            Some(1)
+        );
+        assert_eq!(
+            settings.webtransport_session_limit(WebTransportDraft::Draft15),
+            None
+        );
+        let no_cap = peer(&[(frame::SettingId::ENABLE_WEBTRANSPORT, 1)]);
+        assert_eq!(
+            no_cap.webtransport_session_limit(WebTransportDraft::Draft02),
+            Some(0)
+        );
     }
 
     #[test]

@@ -121,6 +121,15 @@ impl Builder {
         self
     }
 
+    /// Sets the concurrent WebTransport session limit advertised by drafts 02 and 07.
+    ///
+    /// Draft 13 advertises one session because WebTransport flow control is unsupported.
+    /// Draft 15 uses an enable flag instead of a SETTINGS session limit.
+    pub fn max_webtransport_sessions(&mut self, value: u64) -> &mut Self {
+        self.config.settings.max_webtransport_sessions = value;
+        self
+    }
+
     /// Sets the WebTransport drafts to advertise when WebTransport is enabled.
     ///
     /// By default every draft in [`WebTransportDraft::ALL`] is advertised.
