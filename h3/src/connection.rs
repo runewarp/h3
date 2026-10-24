@@ -835,6 +835,11 @@ impl<S, B> RequestStream<S, B> {
             send_grease_frame: grease,
         }
     }
+
+    /// Stops `finish` from sending a grease frame on this stream
+    pub fn disable_grease(&mut self) {
+        self.send_grease_frame = false;
+    }
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {

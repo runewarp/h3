@@ -11,6 +11,7 @@ use crate::{
     config::Config,
     connection::ConnectionInner,
     error::ConnectionError,
+    ext::WebTransportDraft,
     quic::{self},
     shared_state::SharedState,
 };
@@ -108,6 +109,26 @@ impl Builder {
     /// Enables the extended CONNECT protocol required for various HTTP/3 extensions.
     pub fn enable_extended_connect(&mut self, value: bool) -> &mut Self {
         self.config.settings.enable_extended_connect = value;
+        self
+    }
+
+    /// Indicates to the server that WebTransport is supported.
+    ///
+    /// This only advertises WebTransport in the client's SETTINGS, for use by WebTransport client
+    /// implementations; h3 itself does not implement a WebTransport client.
+    pub fn enable_webtransport(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_webtransport = value;
+        self
+    }
+
+    /// Sets the WebTransport drafts to advertise when WebTransport is enabled.
+    ///
+    /// By default every draft in [`WebTransportDraft::ALL`] is advertised.
+    pub fn webtransport_drafts(
+        &mut self,
+        drafts: impl IntoIterator<Item = WebTransportDraft>,
+    ) -> &mut Self {
+        self.config.settings.webtransport_drafts = drafts.into_iter().collect();
         self
     }
 
