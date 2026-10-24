@@ -1084,6 +1084,55 @@ async fn cancelled_close_write_resets_connect_and_releases_capacity() {
 }
 
 #[tokio::test]
+async fn evicting_pending_classifiers_releases_streams_and_goaway_tracking() {
+    timeout(Duration::from_secs(5), async {
+        let (_se, _ce, sq, cq) = connections().await;
+        let core = h3::server::builder()
+            .build::<_, Bytes>(h3_quinn::Connection::new(sq))
+            .await
+            .unwrap();
+        let (mut driver, _) = server::new(core, server::Limits::default());
+        let (mut client_driver, _sender) = h3::client::builder()
+            .build::<_, _, Bytes>(h3_quinn::Connection::new(cq.clone()))
+            .await
+            .unwrap();
+        let mut pending = Vec::new();
+        for (prefix, code) in [
+            (vec![0x40], h3::error::Code::H3_REQUEST_REJECTED.value()),
+            (
+                vec![0x21, 8, 1],
+                h3::error::Code::H3_REQUEST_REJECTED.value(),
+            ),
+            (vec![0x40, 0x41, 0x40], h3_webtransport::WT_SESSION_GONE),
+        ] {
+            let (mut send, recv) = cq.open_bi().await.unwrap();
+            send.write_all(&prefix).await.unwrap();
+            pending.push((send, recv, code));
+        }
+        assert!(timeout(Duration::from_millis(20), driver.accept())
+            .await
+            .is_err());
+        driver.shutdown(0).await.unwrap();
+        assert_eq!(driver.evict_pending_streams(), 3);
+        assert_eq!(driver.evict_pending_streams(), 0);
+        for (send, mut recv, expected) in pending {
+            assert!(matches!(recv.read_chunk(8, true).await,
+                Err(quinn::ReadError::Reset(code)) if code.into_inner() == expected));
+            // Quinn may drop its pending read before applying deferred STOP_SENDING.
+            // The reset code is precise; the receive direction must still be stopped.
+            assert!(send.stopped().await.unwrap().is_some());
+        }
+        client_driver.shutdown(0).await.unwrap();
+        assert!(
+            driver.accept().await.unwrap().is_none(),
+            "evicted classifiers must release H3 request tracking"
+        );
+    })
+    .await
+    .expect("classifier eviction test timed out");
+}
+
+#[tokio::test]
 async fn saturated_prefix_rejection_releases_h3_request_tracking_for_goaway() {
     timeout(Duration::from_secs(5),async {
         let(_se,_ce,sq,cq)=connections().await;

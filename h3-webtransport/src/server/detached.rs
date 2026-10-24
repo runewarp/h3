@@ -136,6 +136,21 @@ impl<C: quic::Connection<B, BidiStream: quic::BidiStream<B>>, B: Buf> Connection
     pub async fn shutdown(&mut self, max_requests: usize) -> Result<(), ConnectionError> {
         self.core.shutdown(max_requests).await
     }
+    /// Abort all currently pending bidi classifiers and return their count.
+    ///
+    /// Call this after an application-owned prefix deadline or during a shutdown drain.
+    /// Cancelling `accept()` alone preserves these streams, which can otherwise wait forever
+    /// and retain H3 request tracking. Unclassified ordinary/unknown streams are rejected with
+    /// H3_REQUEST_REJECTED; streams already identified as WT use WT_SESSION_GONE.
+    /// This drops the classifiers and their buffers/wakers, releases request tracking and frees
+    /// their slots. It leaves returned resolvers, established sessions and validated queues alone.
+    /// Continue polling `accept()` to drive completions. New arrivals may need another eviction;
+    /// use a whole-connection deadline as well. `shutdown()` itself keeps ordinary H3 semantics.
+    pub fn evict_pending_streams(&mut self) -> usize {
+        let count = self.pending.len();
+        self.pending = FuturesUnordered::new();
+        count
+    }
     /// Poll ordinary request intake and bounded session prefix dispatch.
     pub fn poll_accept(
         &mut self,
@@ -452,7 +467,10 @@ impl<C: quic::Connection<B, BidiStream: quic::BidiStream<B>>, B: Buf> Future for
 impl<C: quic::Connection<B, BidiStream: quic::BidiStream<B>>, B: Buf> Drop for Classify<C, B> {
     fn drop(&mut self) {
         if let Some(resolver) = &mut self.resolver {
-            abort(&mut resolver.frame_stream.stream, WT_SESSION_GONE);
+            abort(
+                &mut resolver.frame_stream.stream,
+                Code::H3_REQUEST_REJECTED.value(),
+            );
         }
     }
 }
