@@ -19,9 +19,19 @@ pub struct Setup {
     /// The client's side of the CONNECT stream
     pub stream: ClientStream,
     pub response: Response<()>,
+    pub connection: quinn::Connection,
+    pub driver: ClientDriver,
     // Keep the client alive
     _client: quinn::Endpoint,
     _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+}
+
+pub struct ClientDriver(pub tokio::task::JoinHandle<()>);
+
+impl Drop for ClientDriver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 pub async fn setup() -> Setup {
@@ -68,6 +78,18 @@ pub async fn setup_with(
             .build::<_, Bytes>(h3_quinn::Connection::new(conn))
             .await
             .unwrap();
+        let (request, mut stream) = conn
+            .accept()
+            .await
+            .unwrap()
+            .unwrap()
+            .resolve_request()
+            .await
+            .unwrap();
+        assert_eq!(request.method(), Method::GET);
+        stream.send_response(Response::new(())).await.unwrap();
+        stream.finish().await.unwrap();
+
         let (request, stream) = conn
             .accept()
             .await
@@ -99,10 +121,25 @@ pub async fn setup_with(
         .enable_webtransport(true)
         .enable_datagram(true)
         .webtransport_drafts(client_drafts.iter().copied())
-        .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
+        .build::<_, _, Bytes>(h3_quinn::Connection::new(conn.clone()))
         .await
         .unwrap();
-    tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+    let driver = ClientDriver(tokio::spawn(async move {
+        std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    }));
+
+    // Stream 0 is an ordinary request, so CONNECT must use the full stream ID 4.
+    let mut first = send_request
+        .send_request(
+            Request::get(format!("https://localhost:{}/", addr.port()))
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    first.finish().await.unwrap();
+    assert_eq!(first.recv_response().await.unwrap().status(), 200);
+    assert!(first.recv_data().await.unwrap().is_none());
 
     let mut request = Request::builder()
         .method(Method::CONNECT)
@@ -118,6 +155,8 @@ pub async fn setup_with(
         session: Arc::new(session),
         stream,
         response,
+        connection: conn,
+        driver,
         _client: client,
         _send_request: send_request,
     }
