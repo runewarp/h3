@@ -160,6 +160,7 @@ impl Builder {
         Ok((
             Connection {
                 inner,
+                server_streams: None,
                 sent_closing: None,
                 recv_closing: None,
             },

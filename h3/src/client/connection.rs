@@ -2,6 +2,7 @@
 
 use std::{
     marker::PhantomData,
+    num::NonZeroUsize,
     sync::{atomic::AtomicUsize, Arc},
     task::{Context, Poll},
 };
@@ -25,9 +26,10 @@ use crate::{
     quic::{self, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
+    Settings,
 };
 
-use super::stream::RequestStream;
+use super::{incoming::Dispatch, stream::RequestStream, IncomingStreams};
 
 /// HTTP/3 request sender
 ///
@@ -294,6 +296,7 @@ where
 /// #    C: quic::Connection<B> + Send + 'static,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
+/// #    C::BidiStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
 /// # {
 /// // Run the driver on a different task
@@ -319,6 +322,7 @@ where
 /// #    C: quic::Connection<B> + Send + 'static,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
+/// #    C::BidiStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
 /// # {
 /// // Prepare a channel to stop the driver thread
@@ -358,6 +362,7 @@ where
 {
     /// TODO: breaking encapsulation for RFC9298.
     pub inner: ConnectionInner<C, B>,
+    pub(super) server_streams: Option<Dispatch<C::BidiStream, B>>,
     // Has a GOAWAY frame been sent? If so, this PushId is the last we are willing to accept.
     pub(super) sent_closing: Option<PushId>,
     // Has a GOAWAY frame been received? If so, this is StreamId the last the remote will accept.
@@ -379,6 +384,31 @@ where
     C: quic::Connection<B>,
     B: Buf,
 {
+    /// Register bounded delivery of server-initiated streams for an HTTP/3 extension.
+    ///
+    /// `negotiated` receives the local advertised settings and the actual peer settings.
+    /// It must return true only when both endpoints have negotiated an extension that
+    /// permits these streams. It is never called before peer SETTINGS arrive. Returning
+    /// false, or receiving streams without registration, closes the connection with
+    /// `H3_STREAM_CREATION_ERROR` as required by RFC 9114 section 6.1.
+    ///
+    /// The driver never waits for queue space. Excess streams are reset and stopped with
+    /// `rejection_code`, as are queued streams abandoned by receiver drop, registration
+    /// replacement, driver drop, or driver termination. Dropping the receiver keeps the
+    /// negotiation gate installed, but rejects all later negotiated streams individually.
+    /// Replacing registration ends the old receiver. Delivered streams belong to the
+    /// extension, which must validate their framing and association.
+    pub fn server_initiated_streams(
+        &mut self,
+        capacity: NonZeroUsize,
+        rejection_code: Code,
+        negotiated: fn(&Settings, &Settings) -> bool,
+    ) -> IncomingStreams<C::BidiStream, B> {
+        let (dispatch, incoming) = Dispatch::new(capacity, rejection_code, negotiated);
+        self.server_streams = Some(dispatch);
+        incoming
+    }
+
     /// Initiate a graceful shutdown, accepting `max_push` potentially in-flight server pushes
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn shutdown(&mut self, _max_push: usize) -> Result<(), ConnectionError> {
@@ -395,7 +425,19 @@ where
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
-        while let Poll::Ready(result) = self.inner.poll_control(cx) {
+        let result = self.poll_close_inner(cx);
+        if result.is_ready() {
+            self.server_streams = None;
+        }
+        result
+    }
+
+    fn poll_close_inner(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        const POLL_BUDGET: usize = 32;
+        for index in 0..POLL_BUDGET {
+            let Poll::Ready(result) = self.inner.poll_control(cx) else {
+                break;
+            };
             match result {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
                 //= type=TODO
@@ -464,6 +506,9 @@ where
                     return Poll::Ready(connection_error);
                 }
             }
+            if index + 1 == POLL_BUDGET {
+                cx.waker().wake_by_ref();
+            }
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.1
@@ -471,7 +516,24 @@ where
         //# receipt of a server-initiated bidirectional stream as a connection
         //# error of type H3_STREAM_CREATION_ERROR unless such an extension has
         //# been negotiated.
-        if self.inner.poll_accept_bi(cx).is_ready() {
+        for _ in 0..POLL_BUDGET {
+            let mut stream = match self.inner.poll_accept_bi(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(error),
+                Poll::Ready(Ok(stream)) => stream,
+            };
+            if let Some(dispatch) = &self.server_streams {
+                if self
+                    .peer_settings()
+                    .is_some_and(|peer| (dispatch.negotiated)(&self.inner.config.settings, peer))
+                {
+                    dispatch.send(stream);
+                    continue;
+                }
+            }
+            use crate::quic::{RecvStream, SendStream};
+            stream.reset(Code::H3_STREAM_CREATION_ERROR.value());
+            stream.stop_sending(Code::H3_STREAM_CREATION_ERROR.value());
             return Poll::Ready(
                 self.inner
                     .handle_connection_error(InternalConnectionError::new(
@@ -481,6 +543,9 @@ where
             );
         }
 
+        // Yield even when the peer always has another stream ready. Control processing
+        // runs first on the next poll; no queue capacity wait can stall the driver.
+        cx.waker().wake_by_ref();
         Poll::Pending
     }
 }

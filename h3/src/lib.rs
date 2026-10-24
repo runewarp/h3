@@ -5,6 +5,7 @@
 pub mod client;
 
 mod config;
+pub use config::Settings;
 //pub mod error;
 pub mod ext;
 pub mod quic;
