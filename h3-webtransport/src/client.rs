@@ -467,6 +467,8 @@ where
         if !response.status().is_success() {
             return Err(ConnectError::Rejected(response.status()));
         }
+        // RFC 9110 section 9.3.6: ignore Content-Length and Transfer-Encoding on
+        // successful CONNECT. H3 passes them through without applying body framing.
         let draft_headers = response.headers().get_all("sec-webtransport-http3-draft");
         let mut drafts = draft_headers.iter();
         let header = drafts.next();
@@ -475,12 +477,6 @@ where
             || (negotiation.draft != WebTransportDraft::Draft02 && header.is_some())
             || drafts.next().is_some()
             || response.headers().contains_key("sec-webtransport-protocol")
-            || response
-                .headers()
-                .contains_key(http::header::CONTENT_LENGTH)
-            || response
-                .headers()
-                .contains_key(http::header::TRANSFER_ENCODING)
         {
             return Err(ConnectError::InvalidResponse);
         }

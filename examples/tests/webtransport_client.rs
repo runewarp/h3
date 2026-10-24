@@ -898,7 +898,7 @@ async fn concurrent_accept_waiters_have_independent_wakers() {
 }
 
 #[tokio::test]
-async fn invalid_request_tokens_and_forbidden_response_framing_are_rejected() {
+async fn invalid_request_tokens_are_rejected() {
     timeout(Duration::from_secs(5), async {
         let mut pair = Pair::new(Limits::default(), WebTransportDraft::Draft07, 4).await;
         pair.ordinary().await;
@@ -920,23 +920,85 @@ async fn invalid_request_tokens_and_forbidden_response_framing_are_rejected() {
                 Err(client::ConnectError::InvalidRequest)
             ));
         }
-        for response in [
-            Response::builder()
-                .header("content-length", "0")
-                .body(())
-                .unwrap(),
-            Response::builder()
-                .header("sec-webtransport-http3-draft", "draft02")
-                .header("sec-webtransport-http3-draft", "draft02")
-                .body(())
-                .unwrap(),
-        ] {
-            let (result, mut stream) = pair.try_connect_with(response).await;
-            assert!(matches!(result, Err(client::ConnectError::InvalidResponse)));
-            assert!(stream.recv_data().await.is_err());
-            pair.ordinary().await;
-        }
+        let response = Response::builder()
+            .header("sec-webtransport-http3-draft", "draft02")
+            .header("sec-webtransport-http3-draft", "draft02")
+            .body(())
+            .unwrap();
+        let (result, mut stream) = pair.try_connect_with(response).await;
+        assert!(matches!(result, Err(client::ConnectError::InvalidResponse)));
+        assert!(stream.recv_data().await.is_err());
+        pair.ordinary().await;
     })
     .await
     .expect("CONNECT validation timed out");
+}
+
+#[tokio::test]
+async fn successful_connect_ignores_http_response_framing() {
+    timeout(Duration::from_secs(5), async {
+        for (status, length, encoding, local_close) in [
+            (200, Some("0"), None, false),
+            (204, Some("1"), None, true),
+            (299, Some("18446744073709551615"), None, false),
+            (200, Some("invalid"), None, true),
+            (200, None, Some("chunked"), false),
+            (200, Some("0"), Some("chunked"), true),
+        ] {
+            let mut pair = Pair::new(Limits::default(), WebTransportDraft::Draft07, 4).await;
+            let mut response = Response::builder().status(status);
+            if let Some(length) = length {
+                response = response.header("content-length", length);
+            }
+            if let Some(encoding) = encoding {
+                response = response.header("transfer-encoding", encoding);
+            }
+            let (session, mut connect) = pair.connect_with(response.body(()).unwrap()).await;
+            let (mut send, mut recv) = pair.raw_stream(b"\x40\x41\x00visitor").await;
+            send.finish().unwrap();
+            let mut stream = session.accept_bi().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"visitor");
+            stream.write_all(b"reply").await.unwrap();
+            stream.shutdown().await.unwrap();
+            assert_eq!(recv.read_to_end(64).await.unwrap(), b"reply");
+
+            // CLOSE capsule: type 0x2843, length 4, code 42. DATA is neither
+            // truncated to Content-Length nor decoded as HTTP/1 chunked encoding.
+            let capsule = Bytes::from_static(b"\x68\x43\x04\x00\x00\x00\x2a");
+            if local_close {
+                session.close(42, "").await.unwrap();
+                let mut bytes = Vec::new();
+                while let Some(mut chunk) = connect.recv_data().await.unwrap() {
+                    use bytes::Buf;
+                    bytes.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                }
+                assert_eq!(bytes, capsule);
+            }
+            connect.send_data(capsule).await.unwrap();
+            connect.finish().await.unwrap();
+            assert_eq!(session.closed().await.unwrap().code, 42);
+            assert!(connect.recv_data().await.unwrap().is_none());
+            assert!(session.accept_bi().await.is_none());
+            pair.ordinary().await;
+        }
+        // Framing fields do not turn an unsuccessful CONNECT into a session.
+        let mut pair = Pair::new(Limits::default(), WebTransportDraft::Draft07, 4).await;
+        let response = Response::builder()
+            .status(403)
+            .header("content-length", "0")
+            .header("transfer-encoding", "chunked")
+            .body(())
+            .unwrap();
+        let (result, mut stream) = pair.try_connect_with(response).await;
+        assert!(matches!(
+            result,
+            Err(client::ConnectError::Rejected(http::StatusCode::FORBIDDEN))
+        ));
+        assert!(stream.recv_data().await.is_err());
+        pair.ordinary().await;
+    })
+    .await
+    .expect("CONNECT framing test timed out");
 }
