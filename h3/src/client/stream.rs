@@ -247,6 +247,11 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
+    /// Disable grease frames when finishing this stream, for extension CONNECT streams.
+    pub fn disable_grease(&mut self) {
+        self.inner.disable_grease();
+    }
+
     /// Send some data on the request body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {

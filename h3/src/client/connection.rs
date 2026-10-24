@@ -384,6 +384,20 @@ where
     C: quic::Connection<B>,
     B: Buf,
 {
+    /// The local SETTINGS encoded for advertisement, or `None` when SETTINGS are suppressed.
+    ///
+    /// This reflects wire limits, including draft-specific WebTransport caps, rather than only
+    /// builder configuration. Extension implementations must also wait for actual peer SETTINGS.
+    pub fn advertised_settings(&self) -> Option<Settings> {
+        #[cfg(test)]
+        if !self.inner.config.send_settings {
+            return None;
+        }
+        crate::proto::frame::Settings::try_from(self.inner.config)
+            .ok()
+            .map(|settings| Settings::from(&settings))
+    }
+
     /// Register bounded delivery of server-initiated streams for an HTTP/3 extension.
     ///
     /// `negotiated` receives the local advertised settings and the actual peer settings.

@@ -1020,3 +1020,35 @@ async fn h3_quinn_finish_flushes_buffered_data() {
     // DATA frame: type 0x00, length 7, then the payload.
     assert_eq!(received, b"\x00\x07payload");
 }
+
+#[tokio::test]
+async fn advertised_settings_do_not_claim_suppressed_configuration() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default();
+        let server = pair.server();
+        let (transport, client) = tokio::join!(
+            async { server.endpoint.accept().await.unwrap().await.unwrap() },
+            pair.client(),
+        );
+        let (_server, client) = tokio::join!(
+            async {
+                server::builder()
+                    .build::<_, Bytes>(h3_quinn::Connection::new(transport))
+                    .await
+            },
+            async {
+                client::builder()
+                    .enable_webtransport(true)
+                    .enable_datagram(true)
+                    .enable_extended_connect(true)
+                    .max_webtransport_sessions(8)
+                    .send_settings(false)
+                    .build::<_, _, Bytes>(client)
+                    .await
+            },
+        );
+        assert!(client.unwrap().0.advertised_settings().is_none());
+    })
+    .await
+    .expect("advertised SETTINGS test timed out");
+}
