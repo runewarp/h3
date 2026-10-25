@@ -72,6 +72,41 @@ async fn connections_with_credit(
 }
 
 #[tokio::test]
+async fn buffered_get_ref_preserves_partial_bytes_and_eof() {
+    use h3::quic::RecvStream as _;
+
+    timeout(Duration::from_secs(5), async {
+        let (_se, _ce, sq, cq) = connections().await;
+        let mut send = sq.open_uni().await.unwrap();
+        send.write_all(b"buffered tail").await.unwrap();
+        send.finish().unwrap();
+        let mut adapter = h3_quinn::Connection::new(cq);
+        let recv = futures::future::poll_fn(|cx| {
+            <h3_quinn::Connection as h3::quic::Connection<Bytes>>::poll_accept_recv(
+                &mut adapter,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        let mut recv = h3::stream::BufRecvStream::<_, Bytes>::new(recv);
+        assert!(!futures::future::poll_fn(|cx| recv.poll_read(cx))
+            .await
+            .unwrap());
+        assert_eq!(recv.take_chunk(3).unwrap(), b"buf"[..]);
+        assert_eq!(recv.get_ref().recv_id().into_inner(), u64::from(send.id()));
+        assert_eq!(recv.take_chunk(32).unwrap(), b"fered tail"[..]);
+        assert!(futures::future::poll_fn(|cx| recv.poll_data(cx))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(recv.is_eos());
+    })
+    .await
+    .expect("buffered get_ref test timed out");
+}
+
+#[tokio::test]
 async fn detached_session_opens_while_get_and_put_continue() {
     timeout(Duration::from_secs(5), async {
         let (_se, _ce, sq, cq) = connections().await;
@@ -350,6 +385,165 @@ fn connect_request() -> Request<()> {
     req.extensions_mut()
         .insert(h3::ext::Protocol::WEB_TRANSPORT);
     req
+}
+
+fn completion_observer(
+    future: impl std::future::Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>>
+        + Send
+        + Sync
+        + 'static,
+) -> impl std::future::Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>>
+       + Send
+       + Sync
+       + 'static {
+    future
+}
+
+#[tokio::test]
+async fn send_get_ref_observer_preserves_session_id_bytes_and_fin() {
+    use h3::quic::BidiStream as _;
+
+    timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default().await;
+        pair.ordinary().await;
+        let (session, client) = pair.session().await;
+        assert_eq!(
+            session.session_id(),
+            h3_webtransport::SessionId::try_from(4).unwrap()
+        );
+        assert_eq!(
+            client.session_id(),
+            h3_webtransport::SessionId::try_from(4).unwrap()
+        );
+        let (mut send, mut recv) = session.opener().open_bi().await.unwrap().split();
+        let stopped = completion_observer(send.get_ref().stopped());
+        send.write_all(b"observed tail").await.unwrap();
+        send.shutdown().await.unwrap();
+        drop(send);
+        let mut peer = client.accept_bi().await.unwrap();
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"observed tail");
+        assert_eq!(stopped.await.unwrap(), None);
+        peer.write_all(b"independent reply").await.unwrap();
+        peer.shutdown().await.unwrap();
+        bytes.clear();
+        recv.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"independent reply");
+        pair.ordinary().await;
+    })
+    .await
+    .expect("send get_ref FIN test timed out");
+}
+
+#[tokio::test]
+async fn send_get_ref_observer_cancellation_releases_waker_and_preserves_writes() {
+    use h3::quic::BidiStream as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    struct ObserverTask(AtomicBool);
+    impl Wake for ObserverTask {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default().await;
+        let (session, client) = pair.session().await;
+        let (mut send, _recv) = session.opener().open_bi().await.unwrap().split();
+        let mut stopped = Box::pin(completion_observer(send.get_ref().stopped()));
+        let task = Arc::new(ObserverTask(AtomicBool::new(false)));
+        let weak = Arc::downgrade(&task);
+        {
+            let waker = Waker::from(task);
+            let mut cx = Context::from_waker(&waker);
+            assert!(std::future::Future::poll(stopped.as_mut(), &mut cx).is_pending());
+        }
+        assert!(weak.upgrade().is_some());
+        assert!(!weak.upgrade().unwrap().0.load(Ordering::SeqCst));
+        drop(stopped);
+        assert!(
+            weak.upgrade().is_none(),
+            "cancelled observer retained its task waker"
+        );
+        // Quinn may retain its Notify entry. Cancellation must leave the guarded
+        // stream usable and permit a new, independently owned observation.
+        let stopped = completion_observer(send.get_ref().stopped());
+        send.write_all(b"after cancellation").await.unwrap();
+        send.shutdown().await.unwrap();
+        let mut peer = client.accept_bi().await.unwrap();
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"after cancellation");
+        assert_eq!(stopped.await.unwrap(), None);
+    })
+    .await
+    .expect("send get_ref cancellation test timed out");
+}
+
+#[tokio::test]
+async fn send_get_ref_live_observer_keeps_session_guard_effective() {
+    use futures::{future::poll_fn, FutureExt};
+    use h3::quic::{BidiStream as _, SendStream as _, SendStreamUnframed as _};
+
+    timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default().await;
+        let (session, client) = pair.session().await;
+        let (mut send, _recv) = session.opener().open_bi().await.unwrap().split();
+        let mut peer = client.accept_bi().await.unwrap();
+        let mut stopped = Box::pin(completion_observer(send.get_ref().stopped()));
+        assert!(stopped.as_mut().now_or_never().is_none());
+        session.close(7, "observer still alive").await.unwrap();
+        let (local, remote) = tokio::join!(session.closed(), client.closed());
+        assert_eq!(local.unwrap().code, 7);
+        assert_eq!(remote.unwrap().code, 7);
+        let mut bytes = Bytes::from_static(b"forbidden after close");
+        assert!(matches!(poll_fn(|cx| send.poll_send(cx, &mut bytes)).await,
+            Err(h3::quic::StreamErrorIncoming::StreamTerminated { error_code })
+                if error_code == h3_webtransport::WT_SESSION_GONE));
+        assert_eq!(bytes, b"forbidden after close"[..]);
+        assert!(matches!(poll_fn(|cx| send.poll_finish(cx)).await,
+            Err(h3::quic::StreamErrorIncoming::StreamTerminated { error_code })
+                if error_code == h3_webtransport::WT_SESSION_GONE));
+        assert!(send.write_all(b"also forbidden").await.is_err());
+        let mut bytes = Vec::new();
+        assert!(peer.read_to_end(&mut bytes).await.is_err());
+        assert!(bytes.is_empty());
+        // Do not await RESET acknowledgment: native stopped() has no reliable
+        // RESET-ACK wakeup. A live observer must not hold up session teardown.
+        drop(stopped);
+        pair.ordinary().await;
+    })
+    .await
+    .expect("send get_ref guard test timed out");
+}
+
+#[tokio::test]
+async fn send_get_ref_live_observer_outlives_wrapper_and_connection_teardown() {
+    use futures::FutureExt;
+    use h3::quic::BidiStream as _;
+
+    timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default().await;
+        let (session, client) = pair.session().await;
+        let (send, recv) = session.opener().open_bi().await.unwrap().split();
+        let mut stopped = Box::pin(completion_observer(send.get_ref().stopped()));
+        assert!(stopped.as_mut().now_or_never().is_none());
+        pair.sq.close(0_u32.into(), b"observer teardown");
+        assert!(session.closed().await.is_err());
+        assert!(client.closed().await.is_err());
+        drop((send, recv, session, client, pair));
+        assert!(matches!(
+            stopped.await,
+            Err(quinn::StoppedError::ConnectionLost(
+                quinn::ConnectionError::LocallyClosed
+            ))
+        ));
+    })
+    .await
+    .expect("send get_ref connection teardown test timed out");
 }
 
 #[tokio::test]
