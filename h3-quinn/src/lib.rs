@@ -509,6 +509,32 @@ where
             writing: None,
         }
     }
+
+    /// Observe send completion or peer STOP_SENDING with native Quinn semantics.
+    ///
+    /// On a normal FIN path with no prior reset, `Ok(None)` means the peer has
+    /// acknowledged the local FIN and all sent data, not that its application has
+    /// consumed the data. `Ok(Some(code))` reports the peer's exact STOP_SENDING
+    /// code and can arrive before RESET_STREAM is sent or acknowledged.
+    ///
+    /// This is not a general stream-free notification. After a local reset,
+    /// Quinn provides no reliable RESET acknowledgment wakeup for this future;
+    /// polling after the send state has been removed can also return `Ok(None)`.
+    /// Connection loss and rejected 0-RTT retain Quinn's native errors.
+    ///
+    /// The future is independent of this borrow and may outlive this handle.
+    /// Dropping the future releases its waiter and task waker without resetting
+    /// the stream. Quinn may retain its per-stream notification entry until a
+    /// stream event or connection cleanup. See [`quinn::SendStream::stopped`].
+    /// The ordinary [`quic::SendStream::poll_finish`] still only queues FIN.
+    // Core h3's tests also compile this backend as a private module.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<VarInt>, quinn::StoppedError>> + Send + Sync + 'static
+    {
+        self.stream.stopped()
+    }
 }
 
 impl<B> quic::SendStream<B> for SendStream<B>
