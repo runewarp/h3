@@ -512,6 +512,9 @@ where
 
     /// Observe send completion or peer STOP_SENDING with native Quinn semantics.
     ///
+    /// Requires Quinn 0.11.9 or later, which provides a read-only observer whose
+    /// future is independent of the send-stream borrow.
+    ///
     /// On a normal FIN path with no prior reset, `Ok(None)` means the peer has
     /// acknowledged the local FIN and all sent data, not that its application has
     /// consumed the data. `Ok(Some(code))` reports the peer's exact STOP_SENDING
