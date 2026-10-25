@@ -212,6 +212,18 @@ pub struct SendStream<S, B> {
     guard: SessionGuard<S, B>,
 }
 
+impl<S, B> SendStream<S, B> {
+    /// Returns a shared reference to the underlying QUIC send stream.
+    ///
+    /// This allows backend-specific observation without consuming the wrapper.
+    /// Continue writing, finishing and resetting through this wrapper to retain
+    /// session lifecycle handling. Observations retain the backend's semantics
+    /// and do not establish receive-side or session completion.
+    pub fn get_ref(&self) -> &S {
+        self.stream.get_ref()
+    }
+}
+
 impl<S, B> std::fmt::Debug for SendStream<S, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SendStream")

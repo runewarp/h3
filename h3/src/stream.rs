@@ -407,6 +407,15 @@ impl<S, B> BufRecvStream<S, B> {
             _marker: PhantomData,
         }
     }
+
+    /// Returns a shared reference to the underlying stream.
+    ///
+    /// This does not consume buffered bytes or change the stream's read position.
+    /// Backend-specific observation through this reference retains the backend's
+    /// semantics; it does not account for bytes still buffered by this wrapper.
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
 }
 
 impl<S, B> BufRecvStream<S, B>
